@@ -109,14 +109,17 @@ function setup(replaceOriginal: boolean) {
     console.log(`Registered in Claude Desktop: ${file}`);
     if (!replaceOriginal && cfg.mcpServers["premiere-pro"]) console.log("  note: the original 'premiere-pro' server is still registered. Rerun with --replace-original to remove it (a .bak copy is kept).");
   }
-  // Claude Code (CLI / IDE extensions), if installed.
+  // Claude Code (CLI / IDE extensions), if installed. On Windows `claude` is a
+  // .cmd shim that needs a shell, so quote every argument ourselves.
+  const q = (s: string) => (process.platform === "win32" ? `"${s.replace(/"/g, '""')}"` : s);
+  const claude = (args: string[]) => execFileSync(process.platform === "win32" ? `claude ${args.map(q).join(" ")}` : "claude", process.platform === "win32" ? [] : args, { stdio: "ignore", shell: process.platform === "win32" });
   try {
-    execFileSync("claude", ["mcp", "remove", "--scope", "user", "premiere-pro-plus"], { stdio: "ignore", shell: process.platform === "win32" });
+    claude(["mcp", "remove", "--scope", "user", "premiere-pro-plus"]);
   } catch {
     /* not registered yet */
   }
   try {
-    execFileSync("claude", ["mcp", "add", "--scope", "user", "premiere-pro-plus", "--", process.execPath, entry.args[0]], { stdio: "ignore", shell: process.platform === "win32" });
+    claude(["mcp", "add-json", "--scope", "user", "premiere-pro-plus", JSON.stringify({ type: "stdio", command: entry.command, args: entry.args })]);
     console.log("Registered in Claude Code (user scope).");
   } catch {
     console.log("Claude Code CLI not found; skipped (Claude Desktop is configured).");

@@ -938,9 +938,16 @@
   var _videoOnlyCache = {};
   function videoOnlyVersion(it) {
     var key = String(it.nodeId);
-    if (_videoOnlyCache[key]) { var cached = findItemByNodeId(_videoOnlyCache[key]); if (cached) return cached; }
+    var want = it.name + " [V]";
+    // Node ids restart in every project, so a cached id is only trusted when it
+    // still points at the video-only subclip of the same media file.
+    if (_videoOnlyCache[key]) {
+      var cached = findItemByNodeId(_videoOnlyCache[key]);
+      if (cached && cached.name === want && lower(itemMediaPath(cached)) === lower(itemMediaPath(it))) return cached;
+      delete _videoOnlyCache[key];
+    }
     // reuse an existing one from a previous session
-    var bin = binByPath(SUBCLIP_BIN, true), want = it.name + " [V]";
+    var bin = binByPath(SUBCLIP_BIN, true);
     for (var i = 0; i < bin.children.numItems; i++) {
       var c = bin.children[i];
       if (c.name === want && lower(itemMediaPath(c)) === lower(itemMediaPath(it))) { _videoOnlyCache[key] = String(c.nodeId); return c; }
