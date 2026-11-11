@@ -1,0 +1,51 @@
+{
+  "name": "premiere-pro-mcp-plus",
+  "version": "2.0.0",
+  "description": "Improved MCP server for Adobe Premiere Pro: fast event-driven CEP bridge, JSON-RPC host library, batch timeline building, effect presets, title images, frame previews and an inline MCP App activity widget.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "premiere-pro-mcp-plus": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "start": "node dist/index.js",
+    "test": "npx -y acorn@8 --ecma3 --silent host/premiere-lib.jsx && node --check cep/main.js && node tests/smoke-mcp.mjs",
+    "install-cep": "node dist/index.js --install-cep",
+    "setup": "npm run build && node dist/index.js --setup",
+    "test:e2e": "node tests/e2e-premiere.mjs"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "files": [
+    "dist",
+    "host",
+    "cep",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "premiere-pro",
+    "adobe",
+    "video-editing",
+    "claude",
+    "extendscript",
+    "cep",
+    "mcp-apps"
+  ]
+}

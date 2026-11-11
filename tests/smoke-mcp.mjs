@@ -1,0 +1,22 @@
+// Spawns the server over stdio, runs initialize -> tools/list -> resources/read.
+import { spawn } from "node:child_process";
+const p = spawn(process.execPath, ["dist/index.js"], { stdio: ["pipe", "pipe", "inherit"] });
+let buf = "", id = 0; const waiters = {};
+p.stdout.on("data", d => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line.trim()) continue; const m = JSON.parse(line); if (m.id && waiters[m.id]) waiters[m.id](m); } });
+const req = (method, params) => new Promise(r => { const i = ++id; waiters[i] = r; p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: i, method, params }) + "\n"); });
+const init = await req("initialize", { protocolVersion: "2025-11-25", capabilities: { extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] } } }, clientInfo: { name: "smoke", version: "1" } });
+console.log("server:", init.result?.serverInfo?.name, init.result?.serverInfo?.version, "icons:", init.result?.serverInfo?.icons?.length, "proto:", init.result?.protocolVersion);
+p.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+const tl = await req("tools/list", {});
+const tools = tl.result.tools;
+console.log("tools:", tools.length, "bytes:", JSON.stringify(tools).length);
+console.log("ui meta on first:", JSON.stringify(tools[0]._meta), "icons:", tools[0].icons?.length);
+const rl = await req("resources/list", {});
+console.log("resources:", rl.result.resources.map(r => r.uri + " " + r.mimeType));
+const rr = await req("resources/read", { uri: "ui://premiere-pro-plus/activity.html" });
+console.log("widget html bytes:", rr.result.contents[0].text.length);
+const st = await req("tools/call", { name: "premiere_status", arguments: {} });
+console.log("status:", st.result.content[0].text);
+const bad = await req("tools/call", { name: "get_project", arguments: {} });
+console.log("get_project (no premiere):", bad.result.isError, bad.result.content[0].text.slice(0, 160));
+p.kill();

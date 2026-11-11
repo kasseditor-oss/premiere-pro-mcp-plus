@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Premiere MCP Plus</title>
+<style>
+  :root { --bg:#1d1d1f; --panel:#262628; --text:#e8e8ea; --muted:#9a9aa2; --accent:#9999ff; --ok:#3ecf8e; --warn:#f5a524; --err:#f04e5e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:12px/1.4 "Segoe UI", system-ui, sans-serif; }
+  header { display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--panel); border-bottom:1px solid #333; }
+  .logo { width:26px; height:26px; border-radius:6px; background:#00005b; border:1.5px solid var(--accent); color:var(--accent); font-weight:700; display:grid; place-items:center; font-size:12px; }
+  .title { font-weight:600; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); margin-left:auto; }
+  .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.busy { background:var(--warn); box-shadow:0 0 8px var(--warn); }
+  .dot.err { background:var(--err); }
+  .stats { display:flex; gap:14px; padding:8px 12px; color:var(--muted); }
+  .stats b { color:var(--text); font-weight:600; }
+  #log { margin:0 8px 8px; height:calc(100vh - 110px); overflow:auto; background:#161618; border-radius:6px; padding:6px 8px; font:11px/1.45 Consolas, monospace; }
+  .l { white-space:pre-wrap; word-break:break-word; }
+  .l.ok { color:#b9f5d8; } .l.err { color:#ffb3bb; } .l.info { color:var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">Pr</div>
+    <div><div class="title">MCP Plus bridge</div><div id="status" style="color:var(--muted)">starting…</div></div>
+    <div id="dot" class="dot"></div>
+  </header>
+  <div class="stats"><span>Commands <b id="count">0</b></span><span>Last <b id="last">–</b></span><span>Lib <b id="lib">–</b></span></div>
+  <div id="log"></div>
+  <script src="main.js"></script>
+</body>
+</html>
