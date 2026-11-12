@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.5.1
+
+- Alvo: Premiere Pro 2026 (26.x) em diante, incluindo o 2027. Versões anteriores deixam de ser suportadas; `premiere_status` avisa (`versionWarning`). UXP com `minVersion` 26.0.
+
 ## 2.5.0 — Fase 5: testes, distribuição e documentação
 
 - `--doctor` checa Node, FFmpeg/ffprobe, faster-whisper, CEP (instalado e respondendo), plugin UXP, Media Encoder e a versão do Premiere.

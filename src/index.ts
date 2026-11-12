@@ -176,9 +176,9 @@ function installUxp() {
     try { reg = JSON.parse(raw); } catch { reg = { plugins: [] }; }
   } else fs.mkdirSync(path.dirname(registry), { recursive: true });
   reg.plugins = (reg.plugins || []).filter((p: any) => p.pluginId !== UXP_ID);
-  reg.plugins.push({ hostMinVersion: "25.6.0", name: "Premiere MCP Plus (UXP)", path: "$localPlugins\\External\\" + UXP_ID + "_" + version, pluginId: UXP_ID, status: "enabled", type: "uxp", versionString: version });
+  reg.plugins.push({ hostMinVersion: "26.0.0", name: "Premiere MCP Plus (UXP)", path: "$localPlugins\\External\\" + UXP_ID + "_" + version, pluginId: UXP_ID, status: "enabled", type: "uxp", versionString: version });
   fs.writeFileSync(registry, JSON.stringify(reg));
-  console.log(`Installed UXP plugin to ${dest}\nRestart Premiere Pro (25.6+). It connects to the MCP server on 127.0.0.1.`);
+  console.log(`Installed UXP plugin to ${dest}\nRestart Premiere Pro (2026+). It connects to the MCP server on 127.0.0.1.`);
 }
 function uninstallUxp() {
   const { dest, registry } = uxpPaths();
@@ -223,7 +223,7 @@ async function doctor() {
     const inst = fs.existsSync(u.dest);
     let reg = false;
     try { reg = JSON.parse(fs.readFileSync(u.registry, "utf-8")).plugins.some((p: any) => p.pluginId === UXP_ID); } catch { /* none */ }
-    add("UXP plugin (Premiere 25.6+)", inst && reg ? true : null, inst && reg ? u.dest : "optional: run --install-uxp and restart Premiere");
+    add("UXP plugin", inst && reg ? true : null, inst && reg ? u.dest : "optional: run --install-uxp and restart Premiere");
   } catch {
     add("UXP plugin", null, "UXP not set up on this machine");
   }

@@ -1,15 +1,21 @@
 {
   "name": "premiere-pro-mcp-plus",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "Control Adobe Premiere Pro from Claude Code: batch timeline building, effects, color, audio mix, captions, automatic edits and verified delivery.",
-  "author": { "name": "kasseditor-oss" },
+  "author": {
+    "name": "kasseditor-oss"
+  },
   "homepage": "https://github.com/kasseditor-oss/premiere-pro-mcp-plus",
   "license": "MIT",
   "mcpServers": {
     "premiere-pro-plus": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/start.mjs"],
-      "env": { "PREMIERE_MCP_AUTO_INSTALL": "1" }
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/start.mjs"
+      ],
+      "env": {
+        "PREMIERE_MCP_AUTO_INSTALL": "1"
+      }
     }
   }
 }

@@ -7,7 +7,7 @@ config file is backed up next to itself as `*.bak-<timestamp>` first).
 
 ## Requirements
 
-- Windows 10/11 or macOS with **Adobe Premiere Pro 2022 or newer** (tested on 26.5.2).
+- Windows 10/11 (macOS untested) with **Adobe Premiere Pro 2026 (26.x) or newer**. Older versions are not supported.
 - **Node.js 20+** (`node -v`). If missing, ask the user to install it from nodejs.org.
 - Optional: **FFmpeg** on PATH (analysis, delivery checks, automatic edits) and
   **faster-whisper** (`pip install faster-whisper`, Python 3.9+) for local transcription.
@@ -29,7 +29,7 @@ npm run setup
    (`%APPDATA%\Adobe\CEP\extensions\PremiereMCPPlus` on Windows) and enables
    `PlayerDebugMode` for CSXS 9–13 so the unsigned extension loads. Also copies
    the UXP plugin to `%APPDATA%\Adobe\UXP\Plugins\External` and registers it
-   (Premiere 25.6+, optional; it loads after a Premiere restart).
+   (optional; it loads after a Premiere restart).
 3. Adds a `premiere-pro-plus` server to every Claude Desktop config it finds
    (classic installer and the Microsoft Store/MSIX package).
 4. Registers the server in Claude Code (`claude mcp add --scope user`) if the
