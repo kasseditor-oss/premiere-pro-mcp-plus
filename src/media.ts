@@ -185,3 +185,29 @@ export function findExportPresets(filter?: string): { name: string; path: string
   for (const r of roots) if (fs.existsSync(r)) walk(r, r.includes("Media Encoder") ? "Media Encoder" : "Premiere", 0);
   return out;
 }
+
+/** Poll until a rendered file is complete (ffprobe reads a duration). */
+export async function waitForValidMedia(file: string, timeoutMs: number): Promise<{ valid: boolean; duration?: number; reason?: string }> {
+  const end = Date.now() + timeoutMs;
+  let reason = "file not found";
+  for (;;) {
+    if (fs.existsSync(file)) {
+      try {
+        const { stdout } = await run(which("ffprobe"), ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { windowsHide: true, timeout: 30_000 });
+        const d = Number(stdout.trim());
+        if (d > 0) return { valid: true, duration: Math.round(d * 1000) / 1000 };
+        reason = "no duration";
+      } catch (e: any) {
+        if (e.code === "ENOENT") {
+          // No ffprobe: fall back to a size that stays stable for 5 s.
+          const a = fs.statSync(file).size;
+          await new Promise((r) => setTimeout(r, 5000));
+          return fs.statSync(file).size === a && a > 0 ? { valid: true } : { valid: false, reason: "size still changing" };
+        }
+        reason = String(e.stderr || e.message).split(/\r?\n/).filter(Boolean).pop() || "unreadable";
+      }
+    }
+    if (Date.now() > end) return { valid: false, reason };
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}

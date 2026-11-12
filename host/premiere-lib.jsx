@@ -135,7 +135,13 @@
       }
       if (!next) {
         if (!create) fail("BIN_NOT_FOUND", "Bin not found: " + path);
-        next = cur.createBin(name);
+        cur.createBin(name);
+        // createBin's return value is not reliable on 26.x (it can point at the
+        // parent), so look the new bin up by name.
+        for (var j = 0; j < cur.children.numItems; j++) {
+          var cc = cur.children[j];
+          if (cc && cc.type === 2 && cc.name === name) { next = cc; break; }
+        }
         if (!next) fail("BIN_CREATE_FAILED", "Could not create bin " + name);
       }
       cur = next;
@@ -166,6 +172,17 @@
     if (!r) fail("ITEM_NOT_FOUND", "Project item not found: " + s, "Use list_project_items to get node ids, or import_media first.");
     return r;
   }
+  // Bin path ("A/B") of the bin that holds a project item, or "/" for the root.
+  function binPathOf(item) {
+    var found = null, id = String(item.nodeId);
+    walk(requireProject().rootItem, "", function (it, path) { if (String(it.nodeId) === id) { found = path || "/"; return false; } });
+    return found;
+  }
+  function sequenceFps(item) {
+    var seqs = allSequences();
+    for (var i = 0; i < seqs.length; i++) if (String(seqs[i].projectItem.nodeId) === String(item.nodeId)) return r3(fps(seqs[i]));
+    return null;
+  }
   function describeItem(it, path, details) {
     var d = { id: String(it.nodeId), name: it.name, type: itemType(it) };
     if (path !== undefined) d.bin = path || "/";
@@ -175,7 +192,8 @@
       if (details) {
         try { var o = it.getOutPoint(); var inn = it.getInPoint(); d.duration = r3(tsec(o) - tsec(inn)); } catch (e) {}
         try { if (it.isOffline()) d.offline = true; } catch (e2) {}
-        try { var fi = it.getFootageInterpretation(); if (fi) { d.fps = r3(fi.frameRate); } } catch (e3) {}
+        if (d.type === "sequence") { var sf = sequenceFps(it); if (sf) d.fps = sf; }
+        else { try { var fi = it.getFootageInterpretation(); if (fi && fi.frameRate > 0) { d.fps = r3(fi.frameRate); } } catch (e3) {} }
         try { d.label = it.getColorLabel(); } catch (e4) {}
         try { if (it.hasProxy && it.hasProxy()) d.proxy = true; } catch (e5) {}
       }
@@ -279,7 +297,15 @@
       out: r3(tsec(c.outPoint))
     };
     try { if (c.disabled) d.disabled = true; } catch (e) {}
-    try { var sp = c.getSpeed(); if (sp && Math.abs(sp - 1) > 0.0001 && Math.abs(sp - 100) > 0.0001) d.speed = sp; } catch (e2) {}
+    try {
+      var sp = c.getSpeed();
+      if (sp && Math.abs(sp - 1) > 0.0001 && Math.abs(sp - 100) > 0.0001) {
+        d.speed = sp;
+        // DOM in/out are divided by the speed; report real media seconds.
+        d["in"] = r3(tsec(c.inPoint) * sp);
+        d.out = r3(tsec(c.outPoint) * sp);
+      }
+    } catch (e2) {}
     try { if (c.isSpeedReversed && c.isSpeedReversed()) d.reversed = true; } catch (e3) {}
     if (opts && opts.media) { try { if (c.projectItem) { d.item = String(c.projectItem.nodeId); var mp = itemMediaPath(c.projectItem); if (mp) d.media = mp; } } catch (e4) {} }
     if (opts && opts.effects) {
@@ -655,20 +681,30 @@
 
   H.import_files = function (a) {
     var p = requireProject();
-    var target = a.bin ? binByPath(a.bin, true) : p.getInsertionBin ? p.getInsertionBin() : p.rootItem;
+    var target = a.bin ? binByPath(a.bin, true) : p.rootItem;
     if (!target) target = p.rootItem;
+    // Snapshot the whole tree: Premiere can drop imports into the root or a
+    // parent bin instead of the requested one.
     var before = {};
-    for (var i = 0; i < target.children.numItems; i++) before[String(target.children[i].nodeId)] = true;
+    walk(p.rootItem, "", function (it) { before[String(it.nodeId)] = true; });
     var paths = asArray(a.paths), missing = [], ok = [];
     for (var j = 0; j < paths.length; j++) { var f = new File(paths[j]); if (f.exists) ok.push(f.fsName); else missing.push(paths[j]); }
     if (!ok.length) fail("FILE_NOT_FOUND", "None of the files exist: " + missing.join(", "));
-    var res = p.importFiles(ok, true, target, !!a.as_image_sequence);
-    var created = [];
-    for (var k = 0; k < target.children.numItems; k++) {
-      var c = target.children[k];
-      if (!before[String(c.nodeId)]) created.push(describeItem(c, a.bin || "", false));
+    p.importFiles(ok, true, target, !!a.as_image_sequence);
+    var fresh = [];
+    walk(p.rootItem, "", function (it) { if (!before[String(it.nodeId)] && it.type !== 2) fresh.push(it); });
+    var created = [], targetId = String(target.nodeId);
+    for (var k = 0; k < fresh.length; k++) {
+      var c = fresh[k];
+      if (target !== p.rootItem) {
+        var parentPath = binPathOf(c), wantPath = binPathOf(target);
+        var inTarget = false;
+        for (var t = 0; t < target.children.numItems; t++) if (String(target.children[t].nodeId) === String(c.nodeId)) inTarget = true;
+        if (!inTarget) { try { c.moveBin(target); } catch (eMv) {} }
+      }
+      created.push(describeItem(c, binPathOf(c), false));
     }
-    return { imported: created, missing: missing, requested: paths.length, premiereReturned: res };
+    return { imported: created, missing: missing, requested: paths.length };
   };
 
   H.create_bin = function (a) { var b = binByPath(a.path, true); return { id: String(b.nodeId), name: b.name, path: a.path }; };
@@ -831,7 +867,10 @@
     for (var j = 0; j < seqs.length; j++) if (!before[String(seqs[j].sequenceID)]) copy = seqs[j];
     if (!copy) fail("CLONE_FAILED", "Premiere did not clone the sequence.");
     if (a.name) copy.name = a.name;
-    return summarizeSequence(copy);
+    var res = summarizeSequence(copy);
+    if (a.activate) activate(copy); else activate(s);
+    res.activeSequence = { id: String(app.project.activeSequence.sequenceID), name: app.project.activeSequence.name };
+    return res;
   };
   H.rename_sequence = function (a) { var s = getSequence(a.sequence); s.name = a.name; return { id: String(s.sequenceID), name: s.name }; };
   H.delete_sequence = function (a) { var s = getSequence(a.sequence), n = s.name; app.project.deleteSequence(s); return { deleted: n }; };
@@ -1051,13 +1090,35 @@
     if (!clip) fail("MOGRT_FAILED", "Premiere did not import the MOGRT.");
     if (has(a, "duration")) try { clip.end = seqTime(s, (a.start || 0) + a.duration); } catch (e) {}
     var entry = { clip: clip, track: trackLabel(true, t.index), video: true };
-    var setRes = null;
-    if (a.params) setRes = setMogrtParams(clip, a.params);
     var info = clipInfo(clip, entry.track, -1, {});
+    delete info.index;
+    info.imported = true;
+    var nativeInfo = nativeGraphicInfo(clip);
+    if (nativeInfo) {
+      // Templates made in Premiere's Essential Graphics panel (e.g. the stock
+      // "Basic Lower Third") have no MGT component; their Source Text is an
+      // opaque binary blob that ExtendScript cannot edit.
+      info.nativeGraphic = nativeInfo;
+      info.warning = "Imported. This is a native Premiere graphic, so its text cannot be edited by script. Use an After Effects .mogrt for editable params, or create_title_image for scripted text.";
+      if (a.params) info.paramsNotApplied = true;
+      return info;
+    }
+    if (a.params) info.set = setMogrtParams(clip, a.params);
     info.params = listMogrtParams(clip);
-    if (setRes) info.set = setRes;
     return info;
   };
+  function nativeGraphicInfo(clip) {
+    var mgt = null;
+    try { mgt = clip.getMGTComponent(); } catch (e) {}
+    if (mgt) return null;
+    var texts = 0, layers = [];
+    for (var i = 0; i < clip.components.numItems; i++) {
+      var c = clip.components[i], m = "";
+      try { m = String(c.matchName); } catch (e2) {}
+      if (m === "AE.ADBE Text") { texts++; var pos = null; try { pos = readValue(c.properties[2]); } catch (e3) {} layers.push({ component: i, position: pos }); }
+    }
+    return { textLayers: texts, layers: layers, editableText: false };
+  }
   function mgtComp(clip) {
     var c = null;
     try { c = clip.getMGTComponent(); } catch (e) {}
@@ -1098,12 +1159,20 @@
   }
   H.set_mogrt_params = function (a) {
     var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
-    for (var i = 0; i < list.length; i++) out.push({ id: String(list[i].clip.nodeId), result: setMogrtParams(list[i].clip, a.params) });
+    for (var i = 0; i < list.length; i++) {
+      var nat = nativeGraphicInfo(list[i].clip);
+      if (nat) out.push({ id: String(list[i].clip.nodeId), nativeGraphic: nat, warning: "Native Premiere graphic: text is not editable by script." });
+      else out.push({ id: String(list[i].clip.nodeId), result: setMogrtParams(list[i].clip, a.params) });
+    }
     return { clips: out };
   };
   H.get_mogrt_params = function (a) {
     var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
-    for (var i = 0; i < list.length; i++) out.push({ id: String(list[i].clip.nodeId), params: listMogrtParams(list[i].clip) });
+    for (var i = 0; i < list.length; i++) {
+      var nat = nativeGraphicInfo(list[i].clip);
+      if (nat) out.push({ id: String(list[i].clip.nodeId), nativeGraphic: nat });
+      else out.push({ id: String(list[i].clip.nodeId), params: listMogrtParams(list[i].clip) });
+    }
     return { clips: out };
   };
 
@@ -1138,15 +1207,33 @@
   H.trim_clips = function (a) {
     var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
     for (var i = 0; i < list.length; i++) {
-      var c = list[i].clip;
-      if (has(a, "in")) c.inPoint = timeFromSec(a["in"]);
-      if (has(a, "out")) c.outPoint = timeFromSec(a.out);
-      if (has(a, "start")) c.start = seqTime(s, a.start);
-      if (has(a, "end")) c.end = seqTime(s, a.end);
-      if (has(a, "duration")) c.end = seqTime(s, tsec(c.start) + a.duration);
-      if (has(a, "trim_start")) { c.start = seqTime(s, tsec(c.start) + a.trim_start); }
-      if (has(a, "trim_end")) { c.end = seqTime(s, tsec(c.end) - a.trim_end); }
-      out.push(clipInfo(c, list[i].track, list[i].index, {}));
+      // On Premiere 26 TrackItem.start/end and inPoint/outPoint are independent
+      // setters: moving an edge does not move the media in/out with it. Keep
+      // both in sync. Work in DOM units (speed-scaled), where out - in equals
+      // the timeline duration.
+      var c = list[i].clip, spd = 1;
+      try { spd = c.getSpeed() || 1; } catch (eSp) {}
+      var st = tsec(c.start), en = tsec(c.end), cin = tsec(c.inPoint);
+      var newStart = st, newEnd = en;
+      if (has(a, "start")) newStart = a.start;
+      if (has(a, "trim_start")) newStart = st + a.trim_start;
+      if (has(a, "end")) newEnd = a.end;
+      if (has(a, "duration")) newEnd = newStart + a.duration;
+      if (has(a, "trim_end")) newEnd = en - a.trim_end;
+      var newIn = cin + (newStart - st);
+      if (has(a, "in")) newIn = a["in"] / spd;
+      if (has(a, "out") && !has(a, "end") && !has(a, "duration") && !has(a, "trim_end")) newEnd = newStart + (a.out / spd - newIn);
+      if (newEnd - newStart < 1 / fps(s) - 0.0005) fail("BAD_ARGS", "Trim would leave clip '" + c.name + "' shorter than one frame.");
+      if (newIn < -0.0005) fail("BAD_ARGS", "Trim would move the in point of '" + c.name + "' before the start of its media.");
+      var sT = seqTime(s, newStart), eT = seqTime(s, newEnd);
+      var dur = ticksToSec(parseFloat(eT.ticks) - parseFloat(sT.ticks));
+      // Widen before narrowing so the edges never cross.
+      if (newStart < st) { c.start = sT; c.end = eT; } else { c.end = eT; c.start = sT; }
+      c.inPoint = timeFromSec(newIn);
+      c.outPoint = timeFromSec(newIn + dur);
+      var info = clipInfo(c, list[i].track, list[i].index, {});
+      info.duration = r3(tsec(c.end) - tsec(c.start));
+      out.push(info);
     }
     return { clips: out };
   };
@@ -1210,12 +1297,31 @@
   H.set_speed = function (a) {
     var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
     for (var i = 0; i < list.length; i++) {
-      var e = list[i], qc = qeClipFor(s, e);
-      qc.setSpeed(a.speed, "", !!a.reverse, !!a.ripple, !!a.maintain_pitch);
-      var fresh = findPlacedClip(e.trackObj, parseFloat(e.clip.start.ticks), null, 2) || e.clip;
-      var sp = null;
-      try { sp = fresh.getSpeed(); } catch (ee) {}
-      out.push({ id: String(fresh.nodeId), speed: sp, end: r3(tsec(fresh.end)) });
+      var e = list[i], startTicks = parseFloat(e.clip.start.ticks);
+      var oldSpeed = 1;
+      try { oldSpeed = e.clip.getSpeed() || 1; } catch (es) {}
+      // DOM in/out are in speed-scaled units; convert to real media seconds.
+      var mediaIn = tsec(e.clip.inPoint) * oldSpeed;
+      var mediaDur = (tsec(e.clip.end) - tsec(e.clip.start)) * oldSpeed;
+      var newDur = mediaDur / a.speed;
+      var fr = fps(s), nominal = Math.round(fr), frames = Math.max(1, Math.round(newDur * fr));
+      var tc = pad2(Math.floor(frames / (nominal * 3600))) + ":" + pad2(Math.floor(frames / (nominal * 60)) % 60) + ":" + pad2(Math.floor(frames / nominal) % 60) + ":" + pad2(frames % nominal);
+      // With an empty duration QE keeps the old length and stretches the media.
+      // With the new duration it can still land off target on razored pieces
+      // (1.6 instead of 2); a second call converges, so re-apply until it matches.
+      var fresh = e.clip, sp = null;
+      for (var tries = 0; tries < 3; tries++) {
+        var qc = qeClipFor(s, { clip: fresh, track: e.track, video: e.video });
+        qc.setSpeed(a.speed, tc, !!a.reverse, !!a.ripple, !!a.maintain_pitch);
+        fresh = findPlacedClip(e.trackObj, startTicks, null, 2) || fresh;
+        try { sp = fresh.getSpeed(); } catch (ee) {}
+        if (sp !== null && Math.abs(sp - a.speed) < 0.001) break;
+      }
+      var info = clipInfo(fresh, e.track, -1, {});
+      delete info.index;
+      info.speed = sp;
+      if (sp === null || Math.abs(sp - a.speed) >= 0.001) info.warning = "Premiere settled on speed " + sp + " instead of " + a.speed;
+      out.push(info);
     }
     return { clips: out };
   };
@@ -1276,6 +1382,37 @@
     }
     return { clips: out };
   };
+  // Re-read a clip from its sequence: TrackItem objects can go stale after QE edits
+  // (their component list stops updating), which made every added effect look
+  // like the first one and sent parameters to the wrong effect.
+  function refreshEntry(seq, entry) {
+    var f = findClip(seq, entry.clip.nodeId);
+    if (f) { entry.clip = f.clip; entry.trackObj = f.trackObj; }
+    return entry;
+  }
+  function compKey(c) { var m = ""; try { m = String(c.matchName); } catch (e) {} return m || String(c.displayName); }
+  // Add an effect through QE and return the component it created.
+  function addEffect(seq, entry, kind, name, matchName) {
+    refreshEntry(seq, entry);
+    var before = {}, n0 = entry.clip.components.numItems;
+    for (var i = 0; i < n0; i++) { var k0 = compKey(entry.clip.components[i]); before[k0] = (before[k0] || 0) + 1; }
+    var qc = qeClipFor(seq, entry);
+    if (entry.video) qc.addVideoEffect(qeObject(kind, name)); else qc.addAudioEffect(qeObject(kind, name));
+    refreshEntry(seq, entry);
+    var comps = entry.clip.components, n1 = comps.numItems;
+    if (n1 <= n0) return null;
+    // 1) a component with the expected match name beyond the ones that existed
+    var seen = {};
+    for (var j = 0; j < n1; j++) {
+      var c = comps[j], k = compKey(c);
+      seen[k] = (seen[k] || 0) + 1;
+      if (seen[k] > (before[k] || 0) && ((matchName && k === matchName) || normName(c.displayName) === normName(name))) return c;
+    }
+    // 2) any component kind that grew in count
+    seen = {};
+    for (var q = 0; q < n1; q++) { var c2 = comps[q], k2 = compKey(c2); seen[k2] = (seen[k2] || 0) + 1; if (seen[k2] > (before[k2] || 0)) return c2; }
+    return comps[n1 - 1];
+  }
   function applyEffectsTo(seq, list, effects) {
     var results = [];
     for (var e = 0; e < effects.length; e++) {
@@ -1283,14 +1420,10 @@
       for (var i = 0; i < list.length; i++) {
         var entry = list[i], kind = entry.video ? "video" : "audio";
         var name = resolveCatalogName(kind, spec.name);
-        var obj = qeObject(kind, name);
-        var qc = qeClipFor(seq, entry);
-        var before = entry.clip.components.numItems;
-        if (entry.video) qc.addVideoEffect(obj); else qc.addAudioEffect(obj);
-        var after = entry.clip.components.numItems;
-        var r = { id: String(entry.clip.nodeId), effect: name, added: after > before };
-        if (after > before && spec.params) {
-          var comp = entry.clip.components[after - 1], set = [];
+        var comp = addEffect(seq, entry, kind, name, null);
+        var r = { id: String(entry.clip.nodeId), effect: comp ? comp.displayName : name, matchName: comp ? compKey(comp) : undefined, added: !!comp };
+        if (comp && spec.params) {
+          var set = [];
           for (var k in spec.params) if (spec.params.hasOwnProperty(k)) { var pr = requireProp(comp, k); applyValue(pr, spec.params[k]); set.push(k); }
           r.set = set;
         }
@@ -1443,11 +1576,8 @@
         else {
           var kind = src.video ? "video" : "audio";
           var name = resolveCatalogName(kind, sc.displayName);
-          var before = dst.clip.components.numItems;
-          var qc = qeClipFor(s, dst);
-          if (src.video) qc.addVideoEffect(qeObject(kind, name)); else qc.addAudioEffect(qeObject(kind, name));
-          if (dst.clip.components.numItems <= before) continue;
-          dc = dst.clip.components[dst.clip.components.numItems - 1];
+          dc = addEffect(s, dst, kind, name, compKey(sc));
+          if (!dc) continue;
         }
         copyComponentValues(sc, dc, srcBase, dBase, a.keyframe_mode || "relative");
         copied.push(sc.displayName);
@@ -1495,11 +1625,8 @@
           if (!comp) {
             var kind = entry.video ? "video" : "audio";
             var name = resolveCatalogName(kind, fx.displayName || fx.matchName);
-            var before = entry.clip.components.numItems;
-            var qc = qeClipFor(s, entry);
-            if (entry.video) qc.addVideoEffect(qeObject(kind, name)); else qc.addAudioEffect(qeObject(kind, name));
-            if (entry.clip.components.numItems <= before) throw new Error("Premiere did not add " + name);
-            comp = entry.clip.components[entry.clip.components.numItems - 1];
+            comp = addEffect(s, entry, kind, name, fx.matchName);
+            if (!comp) throw new Error("Premiere did not add " + name);
           }
           var params = fx.params || [], setCount = 0;
           for (var p = 0; p < params.length; p++) {
@@ -1530,7 +1657,9 @@
               }
             } catch (pe) {}
           }
-          done.push({ effect: comp.displayName, params: setCount });
+          var realMatch = "";
+          try { realMatch = String(comp.matchName); } catch (eN) {}
+          done.push({ effect: comp.displayName, matchName: realMatch, presetEffect: fx.displayName, params: setCount });
         } catch (ex) { errs.push((fx.displayName || fx.matchName) + ": " + (ex.message || String(ex))); }
       }
       out.push({ id: String(entry.clip.nodeId), applied: done, errors: errs });
@@ -1716,34 +1845,115 @@
   };
   H.export_fcp_xml = function (a) {
     var s = getSequence(a.sequence);
-    var f = new File(a.path);
+    var f = ensureParentFolder(a.path);
     s.exportAsFinalCutProXML(f.fsName, 1); // 1 = suppress the Translation Report dialog
-    return { path: f.fsName, exists: new File(f.fsName).exists };
+    if (!new File(f.fsName).exists) fail("EXPORT_FAILED", "Premiere did not write " + f.fsName);
+    return { path: f.fsName, exists: true };
   };
   H.export_edl = function (a) {
     var s = getSequence(a.sequence);
-    if (typeof s.exportAsEDL !== "function") fail("UNSUPPORTED", "exportAsEDL is not available on this build");
-    s.exportAsEDL(a.path, a.preset_path || "");
-    return { path: a.path, exists: new File(a.path).exists };
+    var f = ensureParentFolder(a.path);
+    if (typeof s.exportAsEDL !== "function") return { nativeExport: false, fallback: true };
+    s.exportAsEDL(f.fsName, a.preset_path || "");
+    if (!new File(f.fsName).exists) return { nativeExport: false, fallback: true };
+    return { path: f.fsName, exists: true, nativeExport: true };
   };
   H.export_aaf = function (a) {
     var s = getSequence(a.sequence);
+    ensureParentFolder(a.path);
     var ok = app.project.exportAAF(s, a.path, a.mixdown_video ? 1 : 0, a.explode_to_mono ? 1 : 0, a.sample_rate || 48000, a.bits || 16, a.embed_audio ? 1 : 0, 0, a.trim_sources ? 1 : 0, a.handle_frames || 0);
     return { path: a.path, ok: !!ok, exists: new File(a.path).exists };
   };
+  function ensureParentFolder(p) {
+    var f = new File(p), parent = f.parent;
+    if (parent && !parent.exists) parent.create();
+    if (parent && !parent.exists) fail("FOLDER_CREATE_FAILED", "Could not create the folder " + parent.fsName);
+    return f;
+  }
   H.export_media = function (a) {
-    var s = getSequence(a.sequence);
-    var range = a.range === "in_out" ? 1 : a.range === "work_area" ? 2 : 0;
+    var s = getSequence(a.sequence), original = app.project.activeSequence;
     var preset = new File(a.preset_path);
     if (!preset.exists) fail("FILE_NOT_FOUND", "Export preset not found: " + a.preset_path, "Use list_export_presets.");
-    if (a.use_media_encoder) {
-      try { app.encoder.launchEncoder(); } catch (e) {}
-      var jobId = app.encoder.encodeSequence(s, a.path, preset.fsName, range, a.remove_on_completion ? 1 : 0);
-      if (a.start_queue !== false) try { app.encoder.startBatch(); } catch (e2) {}
-      return { queued: true, jobId: jobId, path: a.path, encoder: "Adobe Media Encoder" };
+    var out = ensureParentFolder(a.path);
+    var range = a.range || "entire", src = s, temp = null, rangeInfo = null;
+    // Sequence.exportAsMediaDirect ignores its range argument on Premiere 26.x and
+    // always renders the whole sequence, so export a temporary subsequence instead.
+    if (range !== "entire") {
+      var savedIn = s.getInPointAsTime().seconds, savedOut = s.getOutPointAsTime().seconds;
+      var rin, rout;
+      if (range === "work_area") { rin = s.getWorkAreaInPointAsTime().seconds; rout = s.getWorkAreaOutPointAsTime().seconds; }
+      else { rin = savedIn; rout = savedOut; }
+      if (!(rin > -399999) || !(rout > rin)) fail("NO_RANGE", "The sequence has no " + (range === "in_out" ? "in/out points" : "work area") + " set.", "Set them with manage_sequence action 'range'.");
+      // Where does content start inside the range? createSubsequence drops a
+      // leading gap and ends at the last clip, so both edges are rebuilt below.
+      var firstContent = null;
+      eachClip(s, function (c) {
+        var cs = tsec(c.start), ce = tsec(c.end);
+        if (ce > rin + 0.0005 && cs < rout - 0.0005) { var st0 = cs > rin ? cs : rin; if (firstContent === null || st0 < firstContent) firstContent = st0; }
+      });
+      if (firstContent === null) fail("EMPTY_RANGE", "There is nothing on the timeline between " + r3(rin) + "s and " + r3(rout) + "s.");
+      s.setInPoint(rin); s.setOutPoint(rout);
+      temp = s.createSubsequence(true);
+      try { if (savedIn > -399999) s.setInPoint(savedIn); else s.setInPoint(0); if (savedOut > -399999) s.setOutPoint(savedOut); } catch (eR) {}
+      if (!temp) fail("SUBSEQUENCE_FAILED", "Could not isolate the export range.");
+      temp.name = "_MCP export " + s.name;
+      var leading = firstContent - rin, wantDur = rout - rin;
+      var tempFirst = null, all = [];
+      eachClip(temp, function (c) { all.push(c); var cs = tsec(c.start); if (tempFirst === null || cs < tempFirst) tempFirst = cs; });
+      var shift = leading - (tempFirst || 0);
+      if (shift > 0.0005) {
+        all.sort(function (x, y) { return tsec(y.start) - tsec(x.start); });
+        for (var k = 0; k < all.length; k++) all[k].move(timeFromTicks(snapTicks(temp, secToTicks(shift))));
+      }
+      var tempEnd = parseFloat(temp.end) / TPS;
+      if (tempEnd < wantDur - 0.5 / fps(temp)) {
+        if (!a.filler_path) fail("NO_FILLER", "The range ends with a gap and no filler image was provided.");
+        var fillerItem = null, fbin = binByPath("_MCP Plus", true);
+        for (var fi = 0; fi < fbin.children.numItems; fi++) if (fbin.children[fi].name === "mcp-filler.png") fillerItem = fbin.children[fi];
+        if (!fillerItem) { var fimp = H.import_files({ paths: [a.filler_path], bin: "_MCP Plus" }); fillerItem = findItemByNodeId(fimp.imported[0].id); }
+        addTracksQE(temp, 1, 0);
+        var top = temp.videoTracks[temp.videoTracks.numTracks - 1];
+        top.overwriteClip(fillerItem, 0);
+        var filler = findPlacedClip(top, 0, fillerItem.nodeId, frameTicks(temp));
+        if (filler) filler.end = seqTime(temp, wantDur);
+      }
+      src = temp;
+      rangeInfo = { from: r3(rin), to: r3(rout), duration: r3(wantDur), leadingGap: r3(leading) };
     }
-    var r = s.exportAsMediaDirect(a.path, preset.fsName, range);
-    return { done: true, path: a.path, exists: new File(a.path).exists, result: r };
+    var result;
+    try {
+      if (a.use_media_encoder) {
+        try { app.encoder.launchEncoder(); } catch (e) {}
+        var jobId = app.encoder.encodeSequence(src, out.fsName, preset.fsName, 0, a.remove_on_completion ? 1 : 0);
+        if (a.start_queue !== false) try { app.encoder.startBatch(); } catch (e2) {}
+        result = { queued: true, jobId: jobId, path: out.fsName, encoder: "Adobe Media Encoder" };
+        if (temp) { try { temp.projectItem.moveBin(binByPath("_MCP Plus/Export ranges", true)); } catch (eM) {} result.rangeSequence = temp.name; temp = null; }
+      } else {
+        var r = src.exportAsMediaDirect(out.fsName, preset.fsName, 0);
+        // The call can return while the encoder is still flushing the file.
+        // Wait until its size is stable before touching the source sequence.
+        var wf = new File(out.fsName), lastSize = -1, stable = 0, waited = 0;
+        while (waited < 600000 && stable < 6) {
+          $.sleep(250); waited += 250;
+          wf = new File(out.fsName);
+          var sz = wf.exists ? wf.length : -1;
+          if (sz > 0 && sz === lastSize) stable++; else stable = 0;
+          lastSize = sz;
+        }
+        var written = new File(out.fsName).exists;
+        if (!written) fail("EXPORT_FAILED", "Premiere did not write " + out.fsName + " (" + r + ").", "Save the project and keep the Premiere window visible, then retry.");
+        result = { done: true, path: out.fsName, exists: true, bytes: new File(out.fsName).length };
+        // Deleting the source sequence while the encoder still flushes truncates
+        // the file, so the caller removes the temporary range sequence once the
+        // file is verified (H.delete_sequence).
+        if (temp && a.keep_temp) { result.tempSequence = String(temp.sequenceID); temp = null; }
+      }
+    } finally {
+      if (temp) { try { app.project.deleteSequence(temp); } catch (eD) {} }
+      try { if (original) activate(original); } catch (eA) {}
+    }
+    if (rangeInfo) result.range = rangeInfo;
+    return result;
   };
   H.import_captions = function (a) {
     var s = getSequence(a.sequence);
@@ -1752,7 +1962,7 @@
     var item = findItemByNodeId(imp.imported[0].id);
     var fmt = a.format === "open" ? Sequence.CAPTION_FORMAT_OPEN : a.format === "608" ? Sequence.CAPTION_FORMAT_608 : a.format === "708" ? Sequence.CAPTION_FORMAT_708 : Sequence.CAPTION_FORMAT_SUBTITLE;
     var ok = s.createCaptionTrack(item, a.start || 0, fmt);
-    return { ok: !!ok, item: imp.imported[0].id };
+    return { ok: !!ok, item: imp.imported[0].id, bin: imp.imported[0].bin };
   };
   H.create_subsequence = function (a) {
     var s = getSequence(a.sequence);
@@ -1761,19 +1971,52 @@
     var sub = s.createSubsequence(!!a.ignore_track_targeting);
     if (!sub) fail("SUBSEQUENCE_FAILED", "Premiere did not create the subsequence");
     if (a.name) sub.name = a.name;
-    return summarizeSequence(sub);
+    var res = summarizeSequence(sub);
+    activate(s);
+    res.activeSequence = { id: String(s.sequenceID), name: s.name };
+    return res;
   };
   H.auto_reframe = function (a) {
     var s = getSequence(a.sequence);
     var r = s.autoReframeSequence(a.numerator || 9, a.denominator || 16, a.motion_preset || "default", a.name || (s.name + " (reframed)"), a.use_nested_sequences !== false);
     if (!r) fail("REFRAME_FAILED", "Auto Reframe returned nothing.");
-    return summarizeSequence(r);
+    var res = summarizeSequence(r);
+    if (a.activate) activate(r); else activate(s);
+    res.activeSequence = { id: String(app.project.activeSequence.sequenceID), name: app.project.activeSequence.name };
+    return res;
   };
   H.scene_edit_detection = function (a) {
     var s = getSequence(a.sequence);
     H.select_clips({ sequence: a.sequence, clips: a.clips });
+    var sel = selectClips(s, a.clips || {}), beforeClips = {}, beforeMarkers = {};
+    eachClip(s, function (c) { beforeClips[String(c.nodeId)] = true; });
+    for (var i = 0; i < sel.length; i++) { try { var mk = sel[i].clip.projectItem.getMarkers(), m0 = mk.getFirstMarker(); while (m0) { beforeMarkers[sel[i].clip.projectItem.nodeId + "@" + m0.start.ticks] = true; m0 = mk.getNextMarker(m0); } } catch (eB) {} }
     var r = s.performSceneEditDetectionOnSelection(a.action === "cuts" ? "ApplyCuts" : "CreateMarkers", a.apply_to_linked_audio !== false, a.sensitivity === "low" ? "LowSensitivity" : a.sensitivity === "high" ? "HighSensitivity" : "MediumSensitivity");
-    return { ok: !!r };
+    var res = { ok: !!r, action: a.action === "cuts" ? "cuts" : "markers" };
+    if (a.action === "cuts") {
+      var cuts = [], seenT = {}, times = [];
+      eachClip(s, function (c, label) { if (!beforeClips[String(c.nodeId)]) cuts.push({ id: String(c.nodeId), track: label, start: r3(tsec(c.start)) }); });
+      for (var k = 0; k < cuts.length; k++) if (!seenT[cuts[k].start]) { seenT[cuts[k].start] = 1; times.push(cuts[k].start); }
+      times.sort(function (x, y) { return x - y; });
+      res.newClips = cuts;
+      res.cutTimes = times;
+    } else {
+      var marks = [], seen = {};
+      for (var j = 0; j < sel.length; j++) {
+        try {
+          var pi = sel[j].clip.projectItem, ms = pi.getMarkers(), m = ms.getFirstMarker();
+          var cin = tsec(sel[j].clip.inPoint), cst = tsec(sel[j].clip.start);
+          while (m) {
+            var key = pi.nodeId + "@" + m.start.ticks;
+            if (!beforeMarkers[key] && !seen[key]) { seen[key] = 1; marks.push({ clip: String(sel[j].clip.nodeId), sourceTime: r3(tsec(m.start)), sequenceTime: r3(cst + tsec(m.start) - cin) }); }
+            m = ms.getNextMarker(m);
+          }
+        } catch (eM) {}
+      }
+      res.markers = marks;
+      res.note = "Scene markers are clip markers on the source items (sequenceTime assumes 100% speed).";
+    }
+    return res;
   };
 
   // ---- undo / misc

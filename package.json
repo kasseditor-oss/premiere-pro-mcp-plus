@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs",
     "start": "node dist/index.js",
-    "test": "npx -y acorn@8 --ecma3 --silent host/premiere-lib.jsx && node --check cep/main.js && node tests/smoke-mcp.mjs",
+    "test": "npx -y acorn@8 --ecma3 --silent host/premiere-lib.jsx && node scripts/check-es3.mjs && node --check cep/main.js && node tests/smoke-mcp.mjs",
     "install-cep": "node dist/index.js --install-cep",
     "setup": "npm run build && node dist/index.js --setup",
     "test:e2e": "node tests/e2e-premiere.mjs"

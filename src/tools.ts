@@ -8,6 +8,8 @@ import { WIDGET_URI } from "./branding.js";
 import { findPreset, loadPresets } from "./presets.js";
 import { renderTitle } from "./titles.js";
 import * as media from "./media.js";
+import { buildEdl } from "./edl.js";
+import sharp from "sharp";
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 interface ToolResult {
@@ -295,6 +297,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     {
       action: z.enum(["rename", "duplicate", "delete", "settings", "get_settings", "range"]),
       sequence: seqArg,
+      activate: z.boolean().optional().describe("duplicate: make the copy the active sequence (default false keeps the original active)"),
       name: z.string().optional(),
       width: z.number().int().optional(),
       height: z.number().int().optional(),
@@ -320,6 +323,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     {
       action: z.enum(["subsequence", "auto_reframe", "scene_edit_detection"]),
       sequence: seqArg,
+      activate: z.boolean().optional().describe("auto_reframe: make the new sequence active (default false keeps the original active)"),
       name: z.string().optional(),
       in: z.number().optional(),
       out: z.number().optional(),
@@ -491,7 +495,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "set_clip_speed",
     "Clip speed",
-    "Change clip speed / reverse (QE). The original MCP refused this entirely. Speed 2 = 200%.",
+    "Change clip speed / reverse (QE). Speed 2 = 200%: the clip keeps its media range and its timeline length becomes duration/speed (ripple optional). Works on razored pieces; the result is re-read from Premiere (speed, start/end, media in/out).",
     { sequence: seqArg, clips: clipSelector, speed: z.number().positive(), reverse: z.boolean().optional(), ripple: z.boolean().optional(), maintain_pitch: z.boolean().optional() },
     ANN.write,
     (a) => call("set_speed", a),
@@ -537,7 +541,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "apply_effects",
     "Apply effects",
-    "Add effects to many clips at once, optionally setting parameters. English names work on localized Premiere (Gaussian Blur -> Desfoque gaussiano).",
+    "Add effects to many clips at once, optionally setting parameters. English names work on localized Premiere (Gaussian Blur -> Desfoque gaussiano). Note: on Premiere 26 'Gaussian Blur' is the new GPU blur (match name AE.Impact_Blur_FX, strength param 'Amount'; 'Blurriness' is accepted as an alias); use 'Gaussian Blur (Legacy)' for the classic one. The result reports the real component name and match name.",
     {
       sequence: seqArg,
       clips: clipSelector,
@@ -780,20 +784,55 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         preset = (list.find((p) => /Match Source/i.test(p.name)) || list[0])?.path;
         if (!preset) throw new Error("No export preset found; pass preset_path (see list_export_presets).");
       }
-      return call("export_media", { sequence: a.sequence, path: path.resolve(a.output), preset_path: preset, range: a.range, use_media_encoder: a.use_media_encoder }, (a.wait_timeout_s || 1800) * 1000);
+      // Transparent still used to pad a range that ends in a gap (see host export_media).
+      const filler = path.join(bridge.dir, "mcp-filler.png");
+      if (!fs.existsSync(filler)) await sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toFile(filler);
+      fs.mkdirSync(path.dirname(path.resolve(a.output)), { recursive: true });
+      const out = path.resolve(a.output);
+      const timeout = (a.wait_timeout_s || 1800) * 1000;
+      const run = () => call("export_media", { sequence: a.sequence, path: out, preset_path: preset, range: a.range, use_media_encoder: a.use_media_encoder, filler_path: filler, keep_temp: true }, timeout) as Promise<any>;
+      let res = await run();
+      if (res.queued) return res;
+      // Premiere can return before the file is finalized: wait until it is a valid media file.
+      let check = await media.waitForValidMedia(out, 120_000);
+      if (!check.valid) {
+        if (res.tempSequence) await call("delete_sequence", { sequence: res.tempSequence }).catch(() => undefined);
+        res = await run(); // one retry
+        check = await media.waitForValidMedia(out, 180_000);
+      }
+      if (res.tempSequence) {
+        await call("delete_sequence", { sequence: res.tempSequence }).catch(() => undefined);
+        delete res.tempSequence;
+      }
+      if (!check.valid) throw new Error(`Premiere wrote an incomplete file (${check.reason}). Keep the Premiere window visible and retry, or use use_media_encoder: true.`);
+      return { ...res, bytes: fs.statSync(out).size, duration: check.duration };
     },
   );
 
   tool(
     "export_interchange",
     "Export XML / EDL / AAF",
-    "Export the sequence as Final Cut Pro XML (no 'Translation Report' dialog — the original MCP left it open and blocked the bridge), EDL, or AAF.",
-    { sequence: seqArg, format: z.enum(["fcp_xml", "edl", "aaf"]), path: z.string() },
+    "Export the sequence as Final Cut Pro XML (no 'Translation Report' dialog), CMX3600 EDL, or AAF. Missing folders are created. When Premiere has no EDL exporter (26.x), the EDL is generated from the timeline (video_track + audio_tracks).",
+    {
+      sequence: seqArg,
+      format: z.enum(["fcp_xml", "edl", "aaf"]),
+      path: z.string(),
+      video_track: track.optional().describe("EDL: video track to list (default V1)"),
+      audio_tracks: z.array(z.string()).optional().describe('EDL: audio tracks (default ["A1","A2"])'),
+    },
     ANN.write,
-    (a) => {
+    async (a) => {
       const p = path.resolve(a.path);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
       if (a.format === "fcp_xml") return call("export_fcp_xml", { sequence: a.sequence, path: p }, 120000);
-      if (a.format === "edl") return call("export_edl", { sequence: a.sequence, path: p }, 120000);
+      if (a.format === "edl") {
+        const r: any = await call("export_edl", { sequence: a.sequence, path: p }, 120000);
+        if (r.nativeExport) return { path: p, generator: "premiere" };
+        const tl: any = await call("get_timeline", { sequence: a.sequence, include_effects: false });
+        const edl = buildEdl(tl, { videoTrack: a.video_track, audioTracks: a.audio_tracks });
+        fs.writeFileSync(p, edl.text, "utf-8");
+        return { path: p, generator: "premiere-mcp-plus (CMX3600 from timeline)", events: edl.events, bytes: fs.statSync(p).size };
+      }
       return call("export_aaf", { sequence: a.sequence, path: p }, 600000);
     },
   );
