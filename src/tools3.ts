@@ -285,7 +285,8 @@ export function registerPhase3(ctx: any) {
             const step = 0.5;
             const times: number[] = [];
             for (let t = c.in; t < c.out; t += step) times.push(ae.r3(t));
-            const dir = ensureOutputDir(path.join(os.tmpdir(), "premiere-mcp-plus", "reframe"));
+            const dir = path.join(os.tmpdir(), "premiere-mcp-plus", "reframe");
+            ensureOutputDir(dir);
             const files = await media.extractFrames(c.media, times.slice(0, 120), dir);
             const xs: number[] = [];
             for (const f of files) {
@@ -317,9 +318,10 @@ export function registerPhase3(ctx: any) {
           const env = await an.envelope(c.media, 0.1, c.in, c.out - c.in);
           let words: any[] = [];
           try {
-            words = (await transcriptFor({ ...a, voice: a.voice ?? c.id })).words;
+            // The source's own audio (its linked clip), unless voice is given.
+            words = (await transcriptFor({ ...a, voice: a.voice ?? { kind: "audio", at: ae.r3((c.start + c.end) / 2) } })).words;
           } catch (e: any) {
-            if (e.code !== "TRANSCRIBER_MISSING") throw e;
+            if (!["TRANSCRIBER_MISSING", "NO_AUDIO"].includes(e.code)) throw e;
           }
           const len = a.length ?? 45;
           const picks = ae
@@ -388,7 +390,8 @@ export function registerPhase3(ctx: any) {
           const dk: any = await run("audio", { action: "duck", sequence: a.sequence, voice, music, duck_db: a.duck_db ?? -12 }).catch((e: any) => ({ error: e.message }));
           const wav = media.findExportPresets("Waveform Audio").find((p) => /48/.test(p.name))?.path || media.findExportPresets("Waveform Audio")[0]?.path;
           if (!wav) throw new BridgeError("PRESET_NOT_FOUND", "No 'Waveform Audio' export preset to measure the mix.");
-          const dir = ensureOutputDir(path.join(os.tmpdir(), "premiere-mcp-plus", "mix"));
+          const dir = path.join(os.tmpdir(), "premiere-mcp-plus", "mix");
+          ensureOutputDir(dir);
           const measure = async (n: number) => {
             const r: any = await run("export_sequence", { sequence: a.sequence, output: path.join(dir, `mix_${Date.now()}_${n}.wav`), preset_path: wav });
             return an.loudnessOf(r.path);
@@ -430,7 +433,7 @@ export function registerPhase3(ctx: any) {
           if (a.preview) return { preview: true, offset: s.offset, confidence: s.confidence, placement: spec };
           const imp: any = await call("import_files", { paths: [ext], bin: "_MCP Plus/Synced audio" });
           const pl: any = await call("place_clips", { sequence: a.sequence, clips: [{ ...spec, item: imp.imported[0].id }], auto_create_tracks: true });
-          return { offset: s.offset, confidence: s.confidence, placed: pl.placed[0], errors: pl.errors, verified: pl.placed.length === 1 && (s.confidence ?? 0) > 1.05 };
+          return { offset: s.offset, confidence: s.confidence, placed: pl.placed[0], errors: pl.errors, verified: pl.placed.length === 1 && (s.confidence ?? 0) > 1.5, warning: (s.confidence ?? 0) > 1.5 ? undefined : "Low correlation confidence: check the recordings match." };
         }
         // ------------------------------------------------------------ 11 visual QA
         case "visual_qa": {

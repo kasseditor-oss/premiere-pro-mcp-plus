@@ -71,14 +71,14 @@ return {
   async get_playhead(a) {
     const p = await project();
     const s = await sequence(p, a.sequence);
-    return { playhead: sec(await s.getPlayerPosition()) };
+    return { seconds: sec(await s.getPlayerPosition()) };
   },
   async set_playhead(a) {
     const p = await project();
     const s = await sequence(p, a.sequence);
     await s.setPlayerPosition(tt(a.seconds));
     const now = sec(await s.getPlayerPosition());
-    return { playhead: now, verified: Math.abs(now - a.seconds) < 0.05 };
+    return { seconds: now, verified: Math.abs(now - a.seconds) < 0.05 };
   },
   async markers(a) {
     const p = await project();

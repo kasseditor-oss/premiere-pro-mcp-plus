@@ -146,28 +146,31 @@ export async function syncOffset(a: string, b: string, maxLag = 30) {
   const A = toLin(ea.db);
   const B = toLin(eb.db);
   const L = Math.round(maxLag * rate);
+  const scores = new Map<number, number>();
   let best = -Infinity;
   let bestLag = 0;
-  let second = -Infinity;
   for (let lag = -L; lag <= L; lag++) {
-    let s = 0;
+    let sum = 0;
     let n = 0;
     for (let i = 0; i < B.length; i++) {
       const j = i + lag;
       if (j < 0 || j >= A.length) continue;
-      s += A[j] * B[i];
+      sum += A[j] * B[i];
       n++;
     }
     if (n < rate) continue;
-    const v = s / n;
+    const v = sum / n;
+    scores.set(lag, v);
     if (v > best) {
-      second = best;
       best = v;
       bestLag = lag;
-    } else if (v > second) second = v;
+    }
   }
+  // Confidence: peak over the best correlation more than 0.5 s away from it.
+  let side = -Infinity;
+  for (const [lag, v] of scores) if (Math.abs(lag - bestLag) > rate * 0.5 && v > side) side = v;
   // Refine to 1/8000 s around the coarse lag using raw samples.
-  return { offset: r3(bestLag / rate), confidence: second > 0 ? r3(best / second) : null };
+  return { offset: r3(bestLag / rate), confidence: side > 0 ? r3(best / side) : null };
 }
 
 /** Black frames in a video range (blackdetect). */

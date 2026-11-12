@@ -154,7 +154,7 @@ if (section("qa")) {
 // ------------------------------------------------------------ 12 recipes
 if (section("recipes")) {
   await step("recipes list has canal_padrao", "recipes", { action: "list" }, (d) => d.recipes.some((r) => r.name === "canal_padrao"));
-  await step("recipes save", "recipes", { action: "save", name: "teste_marcas", description: "markers + playhead", params: { t: 2 }, steps: [{ tool: "markers", args: { action: "add", markers: [{ time: "{{t}}", name: "R1" }] } }, { tool: "playhead", args: { seconds: "{{t}}" }, save: "ph" }, { tool: "markers", args: { action: "add", markers: [{ time: 3, name: "ph={{steps.ph.playhead}}" }] } }] }, (d, r) => r.status === "verified");
+  await step("recipes save", "recipes", { action: "save", name: "teste_marcas", description: "markers + playhead", params: { t: 2 }, steps: [{ tool: "markers", args: { action: "add", markers: [{ time: "{{t}}", name: "R1" }] } }, { tool: "playhead", args: { seconds: "{{t}}" }, save: "ph" }, { tool: "markers", args: { action: "add", markers: [{ time: 3, name: "ph={{steps.ph.seconds}}" }] } }] }, (d, r) => r.status === "verified");
   await seq("RC");
   await step("recipes run", "recipes", { action: "run", name: "teste_marcas", sequence: "RC", params: { t: 2 } }, async (d, r) => {
     const ms = (await c.call("markers", { action: "list", sequence: "RC" })).data.markers;
