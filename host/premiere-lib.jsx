@@ -1182,8 +1182,40 @@
 
   // Compact timeline: one row per clip [id, name, start, end, in, out] (DOM in/out,
   // i.e. media seconds / speed), no media paths, effects or track states.
+  // Timeline read cache: valid while nothing changed (our own edits bump
+  // MUTATIONS; edits by hand move Premiere's undo index; sequence end too).
+  var MUTATIONS = 0, _tlCache = {};
+  var FIELD_ORDER = ["id", "name", "start", "end", "in", "out"];
   function compactTimeline(s, a) {
+    var fields = a.fields ? asArray(a.fields) : FIELD_ORDER;
+    var key = MUTATIONS + "|" + undoIndex() + "|" + s.end + "|" + fields.join(",");
+    var sid = String(s.sequenceID), hit = _tlCache[sid];
+    if (hit && hit.key === key && !has(a, "start") && !has(a, "end")) {
+      var outC = { cached: true, fields: hit.res.fields, tracks: [] };
+      for (var kk in hit.res) if (hit.res.hasOwnProperty(kk) && kk !== "tracks") outC[kk] = hit.res[kk];
+      outC.cached = true;
+      var w = null;
+      if (a.tracks) { w = {}; var tl0 = asArray(a.tracks); for (var i0 = 0; i0 < tl0.length; i0++) w[String(tl0[i0]).toUpperCase()] = true; }
+      for (var t0 = 0; t0 < hit.res.tracks.length; t0++) if (!w || w[hit.res.tracks[t0].track]) outC.tracks.push(hit.res.tracks[t0]);
+      return outC;
+    }
+    var full = compactTimelineRead(s, { start: a.start, end: a.end, tracks: has(a, "start") || has(a, "end") ? a.tracks : null }, fields);
+    if (!has(a, "start") && !has(a, "end")) _tlCache[sid] = { key: key, res: full };
+    if (a.tracks && !has(a, "start") && !has(a, "end")) {
+      var w2 = {}, tl2 = asArray(a.tracks), sub = [];
+      for (var i2 = 0; i2 < tl2.length; i2++) w2[String(tl2[i2]).toUpperCase()] = true;
+      for (var t2 = 0; t2 < full.tracks.length; t2++) if (w2[full.tracks[t2].track]) sub.push(full.tracks[t2]);
+      var copy = {};
+      for (var k2 in full) if (full.hasOwnProperty(k2)) copy[k2] = full[k2];
+      copy.tracks = sub;
+      return copy;
+    }
+    return full;
+  }
+  function compactTimelineRead(s, a, fields) {
     var res = summarizeSequence(s), wanted = null, tracks = [];
+    var want = {};
+    for (var f0 = 0; f0 < fields.length; f0++) want[fields[f0]] = true;
     if (a.tracks) { wanted = {}; var tl = asArray(a.tracks); for (var i = 0; i < tl.length; i++) wanted[String(tl[i]).toUpperCase()] = true; }
     var groups = [[s.videoTracks, true], [s.audioTracks, false]];
     for (var g = 0; g < groups.length; g++) {
@@ -1198,12 +1230,22 @@
           var cl = clips[c], cs = ticksToSec(cl.start.ticks), ce = ticksToSec(cl.end.ticks);
           if (has(a, "end") && cs >= a.end) break;
           if (has(a, "start") && ce <= a.start) continue;
-          rows.push([String(cl.nodeId), cl.name, r3(cs), r3(ce), r3(ticksToSec(cl.inPoint.ticks)), r3(ticksToSec(cl.outPoint.ticks))]);
+          var row = [];
+          for (var fi = 0; fi < fields.length; fi++) {
+            var fn = fields[fi];
+            if (fn === "id") row.push(String(cl.nodeId));
+            else if (fn === "name") row.push(cl.name);
+            else if (fn === "start") row.push(r3(cs));
+            else if (fn === "end") row.push(r3(ce));
+            else if (fn === "in") row.push(r3(ticksToSec(cl.inPoint.ticks)));
+            else if (fn === "out") row.push(r3(ticksToSec(cl.outPoint.ticks)));
+          }
+          rows.push(row);
         }
         if (rows.length) tracks.push({ track: label, clips: rows });
       }
     }
-    res.fields = ["id", "name", "start", "end", "in", "out"];
+    res.fields = fields;
     res.tracks = tracks;
     return res;
   }
@@ -2195,7 +2237,48 @@
     for (var q = 0; q < n1; q++) { var c2 = comps[q], k2 = compKey(c2); seen[k2] = (seen[k2] || 0) + 1; if (seen[k2] > (before[k2] || 0)) return c2; }
     return comps[n1 - 1];
   }
+  // Fast path for effects without parameters: one QE pass per track maps clips
+  // by start, the effect is added through QE and checked by the QE component
+  // count (no DOM component scans, which cost ~80 ms per clip).
+  function applyEffectsFast(seq, list, effects) {
+    var qs = qeSequenceFor(seq), maps = {}, results = [], fxCache = {};
+    function mapFor(e) {
+      if (maps[e.track]) return maps[e.track];
+      var idx = trackIndexOf(seq, e), qt = e.video ? qs.getVideoTrackAt(idx) : qs.getAudioTrackAt(idx), m = {};
+      for (var i = 0; i < qt.numItems; i++) { var q = qt.getItemAt(i); if (String(q.type) === "Clip") m[String(Math.round(parseFloat(q.start.ticks) / 1000))] = q; }
+      maps[e.track] = m;
+      return m;
+    }
+    var sample = null;
+    for (var e = 0; e < effects.length; e++) {
+      var spec = typeof effects[e] === "string" ? { name: effects[e] } : effects[e];
+      for (var i = 0; i < list.length; i++) {
+        var entry = list[i], kind = entry.video ? "video" : "audio", key = kind + "|" + spec.name;
+        if (!fxCache[key]) { var nm = resolveCatalogName(kind, spec.name); fxCache[key] = { name: nm, obj: qeObject(kind, nm) }; }
+        var fx = fxCache[key], qi = mapFor(entry)[String(Math.round(parseFloat(entry.clip.start.ticks) / 1000))];
+        if (!qi) qi = qeClipFor(seq, entry);
+        var n0 = qi.numComponents;
+        if (entry.video) qi.addVideoEffect(fx.obj); else qi.addAudioEffect(fx.obj);
+        var ok = qi.numComponents > n0;
+        if (ok && !sample) sample = { entry: entry, name: fx.name };
+        results.push({ id: String(entry.clip.nodeId), effect: fx.name, added: ok });
+      }
+    }
+    // Real component / match name, read once from the DOM.
+    if (sample) {
+      try {
+        refreshEntry(seq, sample.entry);
+        var cs = sample.entry.clip.components, p0 = 0;
+        while (p0 < cs.numItems && isBuiltIn(cs[p0])) p0++;
+        if (p0 < cs.numItems) for (var r = 0; r < results.length; r++) if (results[r].added && results[r].effect === sample.name) { results[r].effect = cs[p0].displayName; results[r].matchName = compKey(cs[p0]); }
+      } catch (eS) {}
+    }
+    return results;
+  }
   function applyEffectsTo(seq, list, effects, cache) {
+    var plain = !cache;
+    for (var pe = 0; pe < effects.length && plain; pe++) if (typeof effects[pe] !== "string" && effects[pe].params) plain = false;
+    if (plain && list.length > 2) return applyEffectsFast(seq, list, effects);
     var results = [], names = {};
     function nameFor(kind, wanted) {
       if (cache) return cache.effect(kind, wanted);
@@ -4151,10 +4234,12 @@
         var data;
         try { data = H[fn](args); }
         finally { if (origSeq) restoreActive(origSeq); }
+        if (!READ_ONLY[fn]) MUTATIONS++;
         if (journaled) try { journalCall(fn, args, before, snap); } catch (eJ) {}
         var np = 0; try { np = app.projects.numProjects; } catch (eN) {}
         return stringify({ ok: true, data: data, ms: new Date().getTime() - started, np: np });
       } catch (e) {
+        if (!READ_ONLY[fn]) MUTATIONS++;
         // A failed call can still have pushed undo steps; record them so the
         // next undo({calls}) stays aligned with Premiere's stack.
         if (journaled) try { journalCall(fn, args, before, snap); } catch (eJ2) {}

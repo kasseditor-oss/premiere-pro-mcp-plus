@@ -1,0 +1,48 @@
+{
+ "date": "2026-11-12T23:35:10.468Z",
+ "premiere": "26.5.2",
+ "lib": "7ee613ca37837ca0",
+ "results": {
+  "place_clips video": {
+   "totalMs": 4704,
+   "perItemMs": 38,
+   "n": 125
+  },
+  "place_clips audio": {
+   "totalMs": 5589,
+   "perItemMs": 45,
+   "n": 125
+  },
+  "place_clips V+A transform+keyframes": {
+   "totalMs": 7816,
+   "perItemMs": 63,
+   "n": 125
+  },
+  "apply_effects": {
+   "totalMs": 3235,
+   "perItemMs": 26,
+   "n": 125
+  },
+  "get_timeline compact (500 clips)": {
+   "totalMs": 495,
+   "perItemMs": 495,
+   "n": 1
+  },
+  "get_timeline compact cached (500 clips)": {
+   "totalMs": 70,
+   "perItemMs": 70,
+   "n": 1
+  },
+  "get_timeline compact id/start/end (500 clips)": {
+   "totalMs": 254,
+   "perItemMs": 254,
+   "n": 1
+  },
+  "premiere_status (x20)": {
+   "totalMs": 470,
+   "perItemMs": 24,
+   "n": 20
+  },
+  "toolsListBytes": 95865
+ }
+}

@@ -25,34 +25,21 @@ interface ToolResult {
 }
 
 const ANN = {
-  read: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  write: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  destructive: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  // Only hints that differ from the MCP defaults (readOnly false, destructive true, idempotent false, openWorld true).
+  read: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  write: { destructiveHint: false, openWorldHint: false },
+  destructive: { openWorldHint: false },
 };
 
 // ---------- shared schemas
-const seqArg = z.string().optional().describe("Sequence id or name. Default: active sequence.");
-const track = z.string().regex(/^[VvAa]\d+$/).describe('Track like "V1", "V2", "A1" (1-based, as in Premiere).');
+const seqArg = z.string().optional().describe("Sequence id/name (default: active)");
+const track = z.string().regex(/^[VvAa]\d+$/).describe("V1, A2... (1-based)");
+// Compact on purpose (it is in most tools' schemas): the host validates the keys.
 const clipSelector = z
-  .union([
-    z.string().describe("A clip id"),
-    z.array(z.string()).describe("Clip ids"),
-    z.object({
-      ids: z.array(z.string()).optional(),
-      tracks: z.array(z.string()).optional().describe('e.g. ["V2","V5"]'),
-      name_regex: z.string().optional(),
-      kind: z.enum(["video", "audio"]).optional(),
-      selected: z.boolean().optional().describe("Only clips selected in the timeline"),
-      at: z.number().optional().describe("Clips under this time (s)"),
-      start_min: z.number().optional(),
-      start_max: z.number().optional(),
-      every_nth: z.number().int().optional(),
-      offset: z.number().int().optional(),
-      limit: z.number().int().optional(),
-    }),
-  ])
-  .describe("Which timeline clips: id, id list, or a selector object (filters combine with AND). Ids come from get_timeline / place_clips.");
-const value = z.union([z.number(), z.boolean(), z.string(), z.array(z.number())]);
+  .union([z.string(), z.array(z.string()), z.record(z.string(), z.any())])
+  .describe("id, [ids] or {tracks,name_regex,kind,selected,at,start_min,start_max,every_nth,offset,limit}");
+// Any property value (the host checks it against the property): number, boolean, string or [numbers].
+const value = z.any().describe("num|bool|str|[num]");
 const keySchema = z.object({
   t: z.union([z.number(), z.literal("end")]).describe('Seconds from clip start, or "end"'),
   v: value,
@@ -60,7 +47,7 @@ const keySchema = z.object({
   offset: z.number().optional().describe('With t:"end": seconds before the end'),
 });
 const animation = z.object({
-  effect: z.string().optional().describe('Component, default "Motion". Accepts display or match name ("Opacity", "Gaussian Blur").'),
+  effect: z.string().optional().describe('default "Motion"'),
   property: z.string().describe('e.g. "Scale", "Position", "Rotation", "Opacity", "Blurriness"'),
   keys: z.array(keySchema),
   unit: z.enum(["px", "norm"]).optional().describe("For Position/Anchor arrays: pixels (default for px) or normalized 0-1"),
@@ -97,8 +84,8 @@ function compact(v: unknown): string {
   return JSON.stringify(v, (_k, x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : x));
 }
 
-const projectArg = z.string().optional().describe("Open project to act on (name or .prproj path). Default: active project.");
-const expectedArg = z.string().optional().describe("Guard: fail with PROJECT_MISMATCH unless this .prproj is the active project.");
+const projectArg = z.string().optional();
+const expectedArg = z.string().optional();
 // Tools that do not touch a project (or manage projects themselves).
 const NO_PROJECT_ARG = new Set(["premiere_status", "bridge_stats", "jobs", "project_file", "analyze_media", "list_export_presets", "list_effect_presets", "batch", "undo", "recipes"]);
 
@@ -208,9 +195,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         title,
         description,
         inputSchema: z.object(full),
-        annotations: { title, ...annotations },
-
-        _meta: { ui: { resourceUri: WIDGET_URI, visibility: ["model", "app"] }, "ui/resourceUri": WIDGET_URI },
+        annotations,
+        _meta: { ui: { resourceUri: WIDGET_URI } },
       } as any,
       (async (args: any) => {
         // Standard envelope: {ok, tool, status, data} or {ok:false, tool, status:"failed", error:{code, message, hint}}.
@@ -262,7 +248,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   };
 
   // ======================================================== status
-  tool("premiere_status", "Premiere status", "Check the connection to Premiere Pro and get version, open project, active sequence, bridge health. Call first when unsure.", {}, ANN.read, async () => {
+  tool("premiere_status", "Premiere status", "Connection, Premiere version, open projects, active sequence, open dialogs, backends (CEP/UXP) and routes. Call first when unsure.", {}, ANN.read, async () => {
     const hb = bridge.heartbeat();
     if (!hb.alive) return { connected: false, bridgeDir: bridge.dir, heartbeatAgeMs: hb.ageMs, fix: "Open Premiere Pro (extension auto-starts). If never installed: run `premiere-pro-mcp-plus --install-cep` and restart Premiere." };
     const [ping, dialogs] = await Promise.all([call("ping", {}, 15000) as Promise<any>, bridge.openDialogs()]);
@@ -276,12 +262,12 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   });
 
   // ======================================================== project
-  tool("get_project", "Project overview", "Project name/path, item counts, all sequences, and the active sequence summary (size, fps, duration, tracks, playhead). compact: true returns only the count of sequences. Warns when several projects are open.", { compact: z.boolean().optional() }, ANN.read, (a) => call("get_state", a));
+  tool("get_project", "Project overview", "Project name/path, item counts, sequences and the active sequence (size, fps, duration, tracks, playhead). compact: true omits the sequence list.", { compact: z.boolean().optional() }, ANN.read, (a) => call("get_state", a));
 
   tool(
     "list_project_items",
     "List project items",
-    "List bins/clips/sequences in the project panel with ids (node ids) used by other tools.",
+    "List bins, clips and sequences with their ids (filter by bin, type, name regex).",
     {
       bin: z.string().optional().describe('Bin path like "Footage/Day1"; default root'),
       recursive: z.boolean().optional().describe("Default true"),
@@ -310,7 +296,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "import_media",
     "Import media",
-    "Import files or whole folders into the project (optionally into a bin; folder structure can be mirrored as bins). Returns the new item ids. FCP XML / .prproj / .srt also accepted as files.",
+    "Import files, a folder (optionally mirrored as bins) or a timeline/project (interchange: FCP XML, EDL, AAF, .prproj, AE comps). Returns the new item ids.",
     {
       paths: z.array(z.string()).optional().describe("Files to import"),
       folder: z.string().optional().describe("Import every media file in this folder"),
@@ -321,7 +307,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       interchange: z
         .object({ kind: z.enum(["fcp_xml", "edl", "aaf", "prproj", "ae_comps", "otio"]), path: z.string(), comps: z.array(z.string()).optional(), sequence_ids: z.array(z.string()).optional() })
         .optional()
-        .describe("Import a timeline/project: FCP XML, EDL, AAF, a whole .prproj or its sequence_ids, After Effects comps (all, or comps by name). OTIO needs the UXP backend."),
+        .describe("Timeline/project import"),
     },
     ANN.write,
     async (a: any) => {
@@ -449,12 +435,12 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   // ======================================================== sequences
   tool("list_sequences", "List sequences", "All sequences with id, size, fps, duration, track counts; marks the active one.", {}, ANN.read, () => call("list_sequences", {}));
 
-  tool("open_sequence", "Open sequence", "Open a sequence in the timeline and make it active.", { sequence: z.string() }, ANN.write, (a) => call("open_sequence", a));
+  tool("open_sequence", "Open sequence", "Open a sequence and make it active.", { sequence: z.string() }, ANN.write, (a) => call("open_sequence", a));
 
   tool(
     "create_sequence",
     "Create sequence",
-    "Create a sequence without any dialog: from explicit settings (e.g. 1080x1920 @30 for Shorts), from a .sqpreset, matching a clip's settings (optionally empty), or from a list of project items placed in order (from_items).",
+    "Create a sequence without dialogs: width/height/fps (e.g. 1080x1920 @30 for Shorts), preset_path (.sqpreset), from_clip (match a clip), or from_items (items placed in order).",
     {
       name: z.string(),
       width: z.number().int().optional(),
@@ -584,7 +570,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "get_timeline",
     "Read timeline",
-    "Compact snapshot of a sequence: tracks (mute/lock/target) with clips (id, name, start/end, source in/out, effects, media), transitions. Filter by tracks and time window to keep it small.",
+    "Sequence snapshot: tracks with clips (id, name, start/end, in/out, effects, media) and transitions. Filter by tracks and time; compact: true returns one row per clip.",
     {
       sequence: seqArg,
       tracks: z.array(z.string()).optional(),
@@ -593,7 +579,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       include_effects: z.boolean().optional(),
       include_media: z.boolean().optional(),
       skip_empty: z.boolean().optional().describe("Omit tracks without clips (default true)"),
-      compact: z.boolean().optional().describe("One array row per clip [id, name, start, end, in, out] (no media, effects, speed or track states): smallest and fastest for big timelines. in/out are media seconds divided by the clip speed."),
+      compact: z.boolean().optional().describe("Rows [id,name,start,end,in,out]; fastest; cached until something changes"),
+      fields: z.array(z.enum(["id", "name", "start", "end", "in", "out"])).optional().describe("compact: columns (fewer = faster)"),
     },
     ANN.read,
     (a) => call("get_timeline", { skip_empty: true, ...a }),
@@ -642,24 +629,25 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     out: z.number().optional().describe("Source out (s)"),
     duration: z.number().optional().describe("Length on timeline (s); for stills sets the still length"),
     end: z.number().optional().describe("Timeline end (s), alternative to duration"),
-    media: z.enum(["both", "video", "audio"]).optional().describe("'video' places picture only and never touches audio tracks (fixes original add_to_timeline pushing/overwriting the voice-over)"),
+    media: z.enum(["both", "video", "audio"]).optional().describe("video: picture only, never touches audio tracks"),
     audio_track: track.optional(),
     mode: z.enum(["overwrite", "insert"]).optional().describe("Default overwrite (never shifts other clips)"),
     name: z.string().optional(),
     enabled: z.boolean().optional(),
-    transform: transform.optional(),
-    effects: z.array(z.union([z.string(), z.object({ name: z.string(), params: z.record(z.string(), value).optional() })])).optional(),
+    // Compact schemas here (place_clips is in every pack); the host validates each field.
+    transform: z.record(z.string(), z.any()).optional().describe("{scale, position:[x,y] px, rotation, anchor, opacity, crop_left.., unit}"),
+    effects: z.array(z.any()).optional().describe("['Gaussian Blur', {name, params}]"),
     keyframes: z.array(animation).optional(),
     properties: z
       .array(z.object({ effect: z.string().optional(), property: z.string(), value, unit: z.enum(["px", "norm"]).optional() }))
       .optional()
-      .describe("Static parameter values set after effects are added, e.g. {effect:'Gaussian Blur', property:'Amount', value:30}"),
+      .describe("[{effect, property, value}]"),
     volume_db: z.number().optional(),
   });
   tool(
     "place_clips",
     "Place clips",
-    "Build a timeline in ONE call: place many project items (with source in/out, duration, track, video-only, transform, effects, keyframes, volume). Missing tracks are created automatically. Each clip is validated before the timeline is touched (start >= 0, 0 <= in < out <= media length, known effects, valid tracks); if anything fails after the edit, that clip and its linked audio are removed, so an error never leaves a clip behind. Returns the new clip ids and per-clip errors.",
+    "Build a timeline in ONE call: many items with in/out, duration, track, transform, effects, keyframes, properties, volume. media:'video' never touches audio tracks. Missing tracks are created; every clip is validated first and a clip that fails is removed with its linked audio. E.g. {clips:[{item:'clipA.mp4', track:'V1', start:0, in:2, out:6}]}",
     {
       sequence: seqArg,
       clips: z.array(placement).min(1),
@@ -675,7 +663,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "find_clips",
     "Find clips",
-    "Find timeline clips with a selector (tracks, name regex, time, selection, every_nth...). Returns ids, timing, media and effects.",
+    "Find timeline clips with a selector (tracks, name_regex, at, selected, every_nth...). Returns ids, timing, media and effects.",
     { sequence: seqArg, clips: clipSelector.optional() },
     ANN.read,
     (a) => call("find_clips", a),
@@ -684,21 +672,21 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "edit_clips",
     "Edit clips",
-    "Move (by delta or to a time), move to another track, trim (start/end/in/out/duration, or trim_start/trim_end; keyframe_policy), enable/disable, rename, color label, link/unlink; slip / slide / roll by delta (s); ripple_trim an edge; duplicate (with effects); freeze_frame (hold the frame at 'at' for duration s); lift_range / extract_range (start..end); split_edit (J/L cut: audio_lead / audio_tail); batch_rename with a pattern. move and trim also move/trim the linked clips (include_linked, default true) and are checked before editing (media range, locked tracks); link needs 2+ clips, unlink takes one clip of the group.",
+    "Edit clips (linked audio follows unless include_linked:false; checked before editing). Actions: move (delta|to), move_to_track, trim (start/end/in/out/duration/trim_start/trim_end, keyframe_policy), set (enabled/name/label), link, unlink, slip/slide/roll (delta s), ripple_trim (edge, delta), duplicate (to, track), freeze_frame (at, duration), lift_range/extract_range (start..end), split_edit (audio_lead J / audio_tail L), batch_rename (pattern 'Cena {n:02}'). E.g. {action:'move', clips:{tracks:['V2']}, delta:1.5}",
     {
       action: z.enum(["move", "move_to_track", "trim", "set", "link", "unlink", "slip", "slide", "roll", "ripple_trim", "duplicate", "freeze_frame", "lift_range", "extract_range", "split_edit", "batch_rename"]),
       sequence: seqArg,
       clips: clipSelector.optional(),
-      edge: z.enum(["start", "end"]).optional().describe("ripple_trim: which edge"),
-      at: z.number().optional().describe("freeze_frame: sequence time of the frame (default the clip start)"),
-      gap: z.number().optional().describe("duplicate: seconds after the original (default 0)"),
-      ripple: z.boolean().optional().describe("freeze_frame: push later clips (default true)"),
-      tracks: z.array(z.string()).optional().describe("lift_range / extract_range: tracks (default all)"),
-      audio_lead: z.number().optional().describe("split_edit: audio starts this many s earlier (J cut)"),
-      audio_tail: z.number().optional().describe("split_edit: audio ends this many s later (L cut)"),
-      pattern: z.string().optional().describe('batch_rename: e.g. "Cena {n:02}" ({n}, {n:02}, {name}, {track})'),
+      edge: z.enum(["start", "end"]).optional(),
+      at: z.number().optional(),
+      gap: z.number().optional(),
+      ripple: z.boolean().optional(),
+      tracks: z.array(z.string()).optional(),
+      audio_lead: z.number().optional(),
+      audio_tail: z.number().optional(),
+      pattern: z.string().optional(),
       start_number: z.number().int().optional(),
-      keyframe_policy: z.enum(["keep", "reject", "keep_relative"]).optional().describe("trim: keep (default), reject when keys fall outside the new range, keep_relative (shift keys with a trimmed start)"),
+      keyframe_policy: z.enum(["keep", "reject", "keep_relative"]).optional(),
       delta: z.number().optional(),
       to: z.number().optional(),
       track: track.optional(),
@@ -712,7 +700,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       enabled: z.boolean().optional(),
       name: z.string().optional(),
       label: z.number().int().min(0).max(15).optional(),
-      include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true"),
+      include_linked: z.boolean().optional(),
     },
     ANN.write,
     async (a: any) => {
@@ -779,8 +767,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "remove_clips",
     "Remove clips",
-    "Delete timeline clips (lift, or ripple to close the gap). Linked clips are removed too unless include_linked: false.",
-    { sequence: seqArg, clips: clipSelector, ripple: z.boolean().optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
+    "Delete clips (lift, or ripple: true to close the gap); linked clips too unless include_linked:false. Ripple-removing 10+ clips asks for a confirmation token.",
+    { sequence: seqArg, clips: clipSelector, ripple: z.boolean().optional(), include_linked: z.boolean().optional().describe("default true") },
     ANN.destructive,
     (a) => call("remove_clips", a),
     {
@@ -798,8 +786,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "razor",
     "Razor cut",
-    "Cut at one or many times, on all tracks or on given tracks. With tracks, the linked clips on other tracks are cut too unless include_linked: false. cuts counts the clips really split; times where no clip spans the cut (e.g. past the end of the sequence) are returned in skipped with a warning.",
-    { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
+    "Cut at one or many times on all tracks or given tracks (linked clips cut too unless include_linked:false). Returns real cuts; times with nothing to cut come back in skipped. E.g. {times:[3,7.5], tracks:['V1']}",
+    { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional(), include_linked: z.boolean().optional().describe("default true") },
     ANN.write,
     (a) => call("razor", a),
     { checkpoint: true },
@@ -889,7 +877,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "apply_effects",
     "Apply effects",
-    "Add effects to many clips at once, optionally setting parameters. English names work on localized Premiere (Gaussian Blur -> Desfoque gaussiano). Note: on Premiere 26 'Gaussian Blur' is the new GPU blur (match name AE.Impact_Blur_FX, strength param 'Amount'; 'Blurriness' is accepted as an alias); use 'Gaussian Blur (Legacy)' for the classic one. The result reports the real component name and match name.",
+    "Add effects to many clips, optionally with params: [{name:'Gaussian Blur', params:{Blurriness:30}}]. English names work on localized Premiere. Reports the real component and match name.",
     {
       sequence: seqArg,
       clips: clipSelector,
@@ -926,8 +914,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "set_transform",
     "Transform clips",
-    "Friendly Motion/Opacity setter: scale %, position in pixels, rotation, anchor, opacity %, crop %.",
-    { sequence: seqArg, clips: clipSelector, ...transform.shape, blend_mode: z.union([z.number().int(), z.string()]).optional().describe("Name (normal, multiply, screen, overlay, add, soft light, difference...; pt-BR names work) or Premiere index") },
+    "Motion/Opacity in friendly units on many clips: scale %, position px, rotation, anchor, opacity %, crop %, blend_mode by name.",
+    { sequence: seqArg, clips: clipSelector, ...transform.shape, blend_mode: z.union([z.number().int(), z.string()]).optional().describe("multiply, screen, overlay... (pt-BR too) or index") },
     ANN.write,
     (a) => call("set_transform", a),
   );
@@ -935,7 +923,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "add_keyframes",
     "Keyframes",
-    "Animate properties on many clips. Times are seconds from each clip's start (or 'end'); handles in-point and speed offsets automatically — e.g. a 100%→106% zoom across every clip in one call.",
+    "Animate properties on many clips; key times are seconds from each clip's start (or 'end', or sequence time with time_base). E.g. a 100->106 zoom: {clips:{tracks:['V1']}, animations:[{property:'Scale', keys:[{t:0,v:100},{t:'end',v:106}]}]}",
     { sequence: seqArg, clips: clipSelector, animations: z.array(animation).min(1) },
     ANN.write,
     (a) => call("add_keyframes", a, 120000),
@@ -1029,8 +1017,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "set_volume",
     "Clip volume",
-    "Set audio clip level in dB, or a dB envelope with keys [{t, db}] (ducking). Selected video clips act on their linked audio.",
-    { sequence: seqArg, clips: clipSelector, db: z.number().optional(), keys: z.array(z.object({ t: z.number(), db: z.number() })).optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
+    "Set clip level (db) or a dB envelope (keys [{t, db}]). Video clips act on their linked audio.",
+    { sequence: seqArg, clips: clipSelector, db: z.number().optional(), keys: z.array(z.object({ t: z.number(), db: z.number() })).optional(), include_linked: z.boolean().optional().describe("default true") },
     ANN.write,
     (a) => call("set_volume", a),
   );
@@ -1039,7 +1027,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     "fade_audio",
     "Audio fades",
     "Fade audio clips in/out with volume keyframes (language-independent). Selected video clips act on their linked audio.",
-    { sequence: seqArg, clips: clipSelector, fade_in: z.number().optional(), fade_out: z.number().optional(), level_db: z.number().optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
+    { sequence: seqArg, clips: clipSelector, fade_in: z.number().optional(), fade_out: z.number().optional(), level_db: z.number().optional(), include_linked: z.boolean().optional().describe("default true") },
     ANN.write,
     (a) => call("fade_audio", a),
   );
@@ -1048,7 +1036,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "markers",
     "Markers",
-    "Sequence markers (or a project item's clip markers): list (filter by type/color), add (batch), delete, update (name, comment, color, duration, time, type), export (CSV or YouTube chapters text), import (CSV/TXT client notes with timecodes).",
+    "Sequence (or item) markers: list (type/color filter), add (batch), delete, update, export (csv | youtube chapters), import (CSV/TXT notes with timecodes). E.g. {action:'add', markers:[{time:12, name:'Parte 2', type:'chapter'}]}",
     {
       action: z.enum(["list", "add", "delete", "update", "export", "import"]),
       sequence: seqArg,
@@ -1058,7 +1046,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       type: z.enum(["comment", "chapter", "segmentation", "web"]).optional().describe("list/export: only this type"),
       color: z.number().int().optional().describe("list/export: only this color"),
       format: z.enum(["csv", "youtube"]).optional().describe("export: CSV, or YouTube chapters text (00:00 Title)"),
-      path: z.string().optional().describe("export: file to write; import: CSV/TXT with timecodes (time,name,comment or 'mm:ss Title' lines)"),
+      path: z.string().optional().describe("export file / import CSV-TXT"),
       markers: z
         .array(z.object({ time: z.number(), name: z.string().optional(), comment: z.string().optional(), duration: z.number().optional(), color: z.number().int().min(0).max(7).optional(), type: z.enum(["comment", "chapter", "segmentation", "web"]).optional(), url: z.string().optional() }))
         .optional(),
@@ -1112,7 +1100,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "playhead",
     "Playhead and playback",
-    "Get or set the playhead (seconds), or action: next_edit / prev_edit (on tracks), next_marker / prev_marker, clip (go to a clip's start or edge 'end'), start, end, play (speed), stop, workspace (list, or switch with name).",
+    "Get/set the playhead (seconds) or action: next_edit, prev_edit, next_marker, prev_marker, clip (edge), start, end, play, stop, workspace (name).",
     {
       sequence: seqArg,
       seconds: z.number().optional(),
@@ -1137,7 +1125,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "export_frames",
     "Export frames",
-    "Render sequence frames at given times and SHOW them (the images come back to the assistant), optionally as one labeled contact sheet. Use to visually verify edits. Files are also saved to disk.",
+    "Render sequence frames at times and SHOW them (contact sheet when >2) to verify edits visually; PNGs are kept on disk.",
     {
       sequence: seqArg,
       times: z.array(z.number()).min(1).max(48),
@@ -1188,7 +1176,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "export_sequence",
     "Export sequence",
-    "Render the sequence to a file using an .epr preset — directly in Premiere (blocks until done) or queued in Adobe Media Encoder. Range: entire / in_out / work_area. Media Encoder reads the saved project, so the project is saved before queueing; pass wait: true to block until AME has written the file.",
+    "Render a sequence to a file with an .epr preset (default H.264 Match Source), directly or via Media Encoder (wait: true waits for the file). range: entire|in_out|work_area. The file is checked with ffprobe. async: true runs it as a job.",
     {
       sequence: seqArg,
       output: z.string(),
@@ -1477,7 +1465,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "batch",
     "Batch operations",
-    "Run several operations in order (stops at the first error unless continue_on_error). fn is the name of any tool of this server (place_clips, edit_clips, markers, playhead, set_clip_speed, apply_effects, set_transform, razor, manage_tracks...) with that tool's arguments in args, e.g. {fn:'markers', args:{action:'add', markers:[{time:5}]}}. Low-level host handler names also work (add_markers, set_playhead, set_speed, move_clips...); consecutive host ops run in one Premiere round trip. Image results are dropped; use export_frames on its own to see frames.",
+    "Run several tool calls in order (stops at the first error unless continue_on_error). ops: [{fn:'<tool name>', args:{...}}], e.g. [{fn:'markers', args:{action:'add', markers:[{time:5}]}}, {fn:'playhead', args:{seconds:5}}]. Host handler names also work; consecutive ones share one Premiere round trip. Images are dropped.",
     { ops: z.array(z.object({ fn: z.string(), args: z.record(z.string(), z.any()).optional() })).min(1), continue_on_error: z.boolean().optional() },
     ANN.write,
     async (a) => {
@@ -1538,7 +1526,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "undo",
     "Undo / redo",
-    "Undo whole tool calls with calls: N (recommended): one tool call can push several Premiere undo steps (set_clip_speed does), and DOM edits like trims and moves never reach Premiere's undo stack, so the server records both per call and rewinds them together. redo: true with calls: N redoes calls undone that way (default 1). steps: N is Premiere's raw undo/redo (Ctrl+Z / Ctrl+Shift+Z) N times and clears the recorded calls. history: true lists the recorded calls. Undo/redo by calls stops with UNDO_STACK_CHANGED if the project was edited by hand since.",
+    "Undo/redo whole tool calls: calls: N (default 1) rewinds Premiere's steps and the DOM edits of the last N calls; redo: true redoes them; steps: N is raw Ctrl+Z; history: true lists recorded calls. Fails with UNDO_STACK_CHANGED after manual edits.",
     {
       calls: z.number().int().min(1).max(50).optional().describe("Undo (or with redo: true, redo) the last N tool calls"),
       steps: z.number().int().min(1).max(50).optional().describe("Raw Premiere undo/redo steps"),
@@ -1558,7 +1546,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "jobs",
     "Background jobs",
-    "Follow tools started with async: true. status/wait return state (running, done, failed, cancelled), progress 0-1, ETA and the result or error; wait blocks up to timeout_s (default 60). list shows recent jobs; cancel stops loops at the next step.",
+    "Follow async: true tools. action status|wait (timeout_s, default 60)|list|cancel; reports state, progress, ETA, result or error.",
     { action: z.enum(["status", "wait", "list", "cancel"]), job_id: z.string().optional(), timeout_s: z.number().optional() },
     ANN.read,
     async (a) => {

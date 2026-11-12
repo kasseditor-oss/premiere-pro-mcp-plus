@@ -26,7 +26,7 @@ export function registerPhase2(ctx: any) {
   tool(
     "inspect",
     "Inspect",
-    "One read tool for the project and timeline. action: project_overview (counts, sequences, offline), sequence (tracks, clips, effects, markers, transitions), clip (effects with values/keyframes, linked clips, source), timeline_summary (duration, coverage per track, gaps, effects used, disabled/offline/speed clips), gaps, health (summary + black frames, flashes, clipping audio checked with FFmpeg on the clips' media), used_media, unused_media, duplicates, offline, state (project, sequence, playhead, selection, targeted tracks).",
+    "Read project/timeline facts. action: project_overview, sequence, clip, timeline_summary (coverage, gaps, effects, disabled/offline/speed clips), gaps, health (+ black frames, flashes, audio clipping via FFmpeg), used_media, unused_media, duplicates, offline, state (playhead, selection, targeted tracks). E.g. {action:'health'}",
     {
       action: z.enum(["project_overview", "sequence", "clip", "timeline_summary", "gaps", "health", "used_media", "unused_media", "duplicates", "offline", "state"]),
       sequence: seqArg,

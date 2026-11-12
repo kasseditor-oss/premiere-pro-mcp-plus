@@ -63,16 +63,16 @@ export function profileFor(tool: string): Profile {
 
 const PACKS: Record<string, string[]> = {
   essential: [
-    "premiere_status", "get_project", "get_timeline", "list_project_items", "import_media", "create_sequence", "open_sequence", "place_clips",
-    "find_clips", "edit_clips", "remove_clips", "razor", "set_transform", "apply_effects", "add_keyframes", "set_volume", "markers", "playhead",
-    "export_frames", "export_sequence", "undo", "batch", "inspect", "jobs",
+    "premiere_status", "get_project", "get_timeline", "list_project_items", "import_media", "create_sequence", "place_clips",
+    "edit_clips", "remove_clips", "razor", "set_transform", "apply_effects", "add_keyframes", "markers", "playhead",
+    "export_frames", "export_sequence", "undo", "batch", "jobs",
   ],
   editing: [
-    "manage_sequence", "sequence_tools", "manage_tracks", "set_clip_speed", "close_gaps", "select_clips", "ripple_delete_ranges", "source", "checkpoint",
+    "inspect", "find_clips", "open_sequence", "set_volume", "manage_sequence", "sequence_tools", "manage_tracks", "set_clip_speed", "close_gaps", "select_clips", "ripple_delete_ranges", "source", "checkpoint",
     "copy_effects", "remove_effects", "set_properties", "keyframe_tools", "remove_keyframes", "add_transitions", "apply_effect_preset", "list_effect_presets",
     "list_available_effects", "get_clip_effects", "auto_edit", "recipes", "manage_bins", "manage_project_items", "search_items", "metadata",
   ],
-  audio: ["audio", "fade_audio", "set_volume", "analyze_media", "transcribe", "auto_edit"],
+  audio: ["audio", "fade_audio", "set_volume", "find_clips", "analyze_media", "transcribe", "auto_edit"],
   color: ["color", "scopes", "set_properties", "get_clip_effects", "apply_effects", "remove_effects", "list_available_effects", "adjustment_layer"],
   captions: ["captions", "transcribe", "import_captions", "create_title_image", "mogrt"],
   delivery: ["export_interchange", "list_export_presets", "deliver", "encode", "review", "project_file", "project_tools", "media"],
@@ -84,7 +84,6 @@ export function packTools(): Set<string> | null {
   if (!l.length || l.includes("full")) return null;
   const out = new Set<string>(PACKS.essential);
   for (const p of l) for (const t of PACKS[p] || []) out.add(t);
-  out.add("bridge_stats");
   return out;
 }
 
