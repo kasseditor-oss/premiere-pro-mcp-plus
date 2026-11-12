@@ -37,7 +37,32 @@ function createServer() {
     }),
   );
   registerTools(server, bridge);
+  compactToolList(server);
   return server;
+}
+
+/**
+ * tools/list goes into the model's context on every turn: drop the per-tool
+ * "$schema" URL and empty fields (a few KB on 70+ tools). Wraps the SDK handler.
+ */
+function compactToolList(server: any) {
+  try {
+    const low = server.server;
+    low.setRequestHandler; // ensure handlers exist
+    const map: Map<string, any> = low._requestHandlers;
+    const orig = map?.get("tools/list");
+    if (!orig) return;
+    map.set("tools/list", async (...args: any[]) => {
+      const r = await orig(...args);
+      for (const t of r?.tools || []) {
+        if (t.inputSchema) delete t.inputSchema.$schema;
+        for (const k of Object.keys(t)) if (t[k] === undefined) delete t[k];
+      }
+      return r;
+    });
+  } catch {
+    /* SDK internals changed: keep the default list */
+  }
 }
 
 let bridgeSingleton: PremiereBridge | null = null;
@@ -174,18 +199,48 @@ function uninstallCep() {
 async function doctor() {
   const b = sharedBridge();
   const hb = b.heartbeat();
-  console.log(`premiere-pro-mcp-plus ${VERSION}`);
-  console.log(`bridge dir: ${b.dir}`);
-  console.log(`CEP extension: ${fs.existsSync(cepTargetDir()) ? "installed at " + cepTargetDir() : "NOT installed (run --install-cep)"}`);
-  console.log(`panel heartbeat: ${hb.alive ? "alive" : "not alive"} (age ${hb.ageMs ?? "n/a"} ms)`);
+  const rows: { check: string; ok: boolean | null; info: string }[] = [];
+  const add = (check: string, ok: boolean | null, info: string) => rows.push({ check, ok, info });
+  const run = (cmd: string, args: string[]) => {
+    try {
+      return execFileSync(cmd, args, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, windowsHide: true }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  add("Node.js >= 20", nodeMajor >= 20, process.version);
+  const ffv = run("ffmpeg", ["-hide_banner", "-version"]);
+  add("FFmpeg (analysis, verify, auto_edit)", !!ffv, ffv ? ffv.split(/\r?\n/)[0].slice(0, 60) : "not on PATH (winget install ffmpeg / brew install ffmpeg)");
+  add("ffprobe", !!run("ffprobe", ["-version"]), "");
+  let py: string | null = null;
+  for (const c of [process.env.PREMIERE_MCP_PYTHON, "python", "python3", "py"].filter(Boolean) as string[]) if (run(c, ["-c", "import faster_whisper"]) !== null) { py = c; break; }
+  add("faster-whisper (transcribe, captions, fillers)", py ? true : null, py ? `via ${py}` : "optional: pip install faster-whisper");
+  add("CEP extension", fs.existsSync(cepTargetDir()), fs.existsSync(cepTargetDir()) ? cepTargetDir() : "run --install-cep");
+  add("CEP panel heartbeat", hb.alive, hb.alive ? `alive (${hb.ageMs} ms)` : `not alive (age ${hb.ageMs ?? "n/a"} ms): open Premiere`);
+  try {
+    const u = uxpPaths();
+    const inst = fs.existsSync(u.dest);
+    let reg = false;
+    try { reg = JSON.parse(fs.readFileSync(u.registry, "utf-8")).plugins.some((p: any) => p.pluginId === UXP_ID); } catch { /* none */ }
+    add("UXP plugin (Premiere 25.6+)", inst && reg ? true : null, inst && reg ? u.dest : "optional: run --install-uxp and restart Premiere");
+  } catch {
+    add("UXP plugin", null, "UXP not set up on this machine");
+  }
+  const ame = process.platform === "win32" ? ["C:/Program Files/Adobe"].flatMap((d) => (fs.existsSync(d) ? fs.readdirSync(d).filter((x) => /Media Encoder/i.test(x)) : [])) : fs.existsSync("/Applications") ? fs.readdirSync("/Applications").filter((x) => /Media Encoder/i.test(x)) : [];
+  add("Adobe Media Encoder (encode, proxies, AME exports)", ame.length ? true : null, ame.join(", ") || "optional");
   if (hb.alive) {
     try {
-      const r = await b.call("ping", {}, { timeoutMs: 15000 });
-      console.log("ping:", JSON.stringify(r));
+      const r: any = await b.call("ping", {}, { timeoutMs: 15000 });
+      add("Premiere Pro", true, `${r.premiere} (${r.locale}), project: ${r.project?.name ?? "none"}`);
     } catch (e: any) {
-      console.log("ping failed:", e.message);
+      add("Premiere Pro", false, "ping failed: " + e.message);
     }
-  }
+  } else add("Premiere Pro", false, "not reachable");
+  console.log(`premiere-pro-mcp-plus ${VERSION}  (bridge dir ${b.dir})`);
+  for (const r of rows) console.log(`${r.ok === true ? "OK  " : r.ok === null ? "--  " : "FAIL"}  ${r.check.padEnd(50)} ${r.info}`);
+  if (process.argv.includes("--json")) console.log(JSON.stringify(rows));
+  b.uxp.dispose();
 }
 
 const argv = process.argv.slice(2);
@@ -197,6 +252,20 @@ else if (argv.includes("--uninstall-uxp")) uninstallUxp();
 else if (argv.includes("--doctor")) doctor().then(() => process.exit(0));
 else if (argv.includes("--version")) console.log(VERSION);
 else {
+  // Bundles (.mcpb, plugins) cannot run --setup: install the Premiere side on
+  // first start when asked to. stdout is the MCP channel, so log to stderr.
+  if (process.env.PREMIERE_MCP_AUTO_INSTALL === "1") {
+    const log = console.log;
+    console.log = (...m: unknown[]) => console.error("[premiere-pro-plus]", ...m);
+    try {
+      if (!fs.existsSync(cepTargetDir())) installCep();
+      try { if (!fs.existsSync(uxpPaths().dest)) installUxp(); } catch { /* no UXP */ }
+    } catch (e: any) {
+      console.error("[premiere-pro-plus] auto install failed:", e?.message);
+    } finally {
+      console.log = log;
+    }
+  }
   serveStdio(() => createServer() as any, { onerror: (e) => console.error("[premiere-pro-plus]", e) });
 }
 

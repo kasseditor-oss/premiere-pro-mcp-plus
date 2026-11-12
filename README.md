@@ -1,119 +1,164 @@
 # Premiere Pro MCP Plus
 
-Servidor MCP para controlar o **Adobe Premiere Pro** pelo Claude. É uma recriação
-melhorada do `premiere-pro-mcp` (leancoderkavy, MIT): ponte mais rápida, menos
-ferramentas porém mais poderosas, funções novas e correções de bugs.
+Servidor MCP para controlar o **Adobe Premiere Pro** pelo Claude (ou outro cliente MCP).
+Monta timelines inteiras numa chamada, aplica efeitos, cor e mixagem de áudio, faz
+legendas e edições automáticas (jump cut, vícios de fala, multicam, Shorts) e entrega
+arquivos conferidos com FFmpeg. Toda escrita relê o Premiere e diz se foi verificada.
 
-## Instalar (um prompt)
+Ponte dupla: **CEP/ExtendScript** (todas as versões recentes) e **UXP** (Premiere 25.6+),
+escolhida por ação conforme o que cada uma suporta.
 
-Mande para o Claude: *"Instala esse MCP: &lt;link do repositório&gt;"*.
+## Instalar
+
+Mande para o Claude: *"Instala esse MCP: https://github.com/kasseditor-oss/premiere-pro-mcp-plus"*.
 O Claude segue o [INSTALL.md](INSTALL.md). Manualmente:
 
 ```bash
-git clone <link> premiere-pro-mcp-plus
+git clone https://github.com/kasseditor-oss/premiere-pro-mcp-plus
 cd premiere-pro-mcp-plus
 npm install
-npm run setup     # build + extensão CEP + registra no Claude Desktop e Claude Code
+npm run setup     # build + extensão CEP + plugin UXP + registro no Claude Desktop e Claude Code
+node dist/index.js --doctor
 ```
 
-Reinicie o Claude Desktop e o Premiere Pro. Teste com `node dist/index.js --doctor`.
+Reinicie o Claude Desktop e o Premiere Pro.
 
-## O que tem de novo em relação ao original
+Outras formas:
+- **Claude Desktop (.mcpb):** `npm run build && node scripts/build-mcpb.mjs` e abra o bundle gerado.
+- **Plugin do Claude Code:** `/plugin marketplace add kasseditor-oss/premiere-pro-mcp-plus`, depois `/plugin install premiere-pro-mcp-plus@premiere-pro-mcp-plus`.
+- **Cursor, Codex, VS Code:** ver [docs/CLIENTS.md](docs/CLIENTS.md).
 
-| | Original 1.24.1 | Plus 2.0 |
-|---|---|---|
-| Tamanho da lista de tools (contexto do Claude) | 432 tools, 2,18 MB | 51 tools, 81 KB (~27× menor) |
-| Ponte | script inteiro gerado por chamada, polling 200 ms | biblioteca carregada uma vez + JSON-RPC, `fs.watch` |
-| Widget no chat (MCP Apps) e ícone | não | card do Premiere com status, resumo e prévia de frames |
-| Montar timeline | 1 clipe por chamada (ou gambiarra com FCP XML) | `place_clips`: dezenas de clipes com in/out, transform, efeitos e keyframes numa chamada |
-| Clipe só com vídeo | `add_to_timeline` empurrava/sobrescrevia o áudio | `media:"video"` nunca toca nas trilhas de áudio |
-| Presets de efeito | impossível (precisava arrastar com computer use) | `apply_effect_preset` lê o `.prfpset` e aplica efeitos + keyframes |
-| Exportar FCP XML | abria o diálogo "Translation Report" e travava | sem diálogo |
-| Velocidade do clipe | recusado | `set_clip_speed` (2×, reverso) |
-| Títulos | não | `create_title_image`: PNG com fonte (.ttf), contorno, sublinhado, sombra, e já coloca na timeline |
-| Trocar PNG em uso | cache do Premiere / arquivo travado | `replace_media` e títulos salvam com nome novo automaticamente |
-| Seletores | por clipe | `{tracks, name_regex, every_nth, at...}` em quase todas as tools |
-| Efeitos em Premiere em português | nomes tinham que ser exatos | aceita nomes em inglês e traduz (Gaussian Blur, Cross Dissolve...) |
-| Ver o resultado | `export_frame` 1 arquivo | `export_frames` devolve as imagens / contact sheet para o Claude ver |
-| Análise de mídia | — | silêncios, cortes de cena, LUFS, probe (FFmpeg local) |
-| Lote | — | `batch`: várias operações num só round-trip |
+Opcionais: **FFmpeg** (análise, verificação de entrega, edições automáticas) e
+**faster-whisper** (`pip install faster-whisper`; transcrição local, legendas, remoção de vícios).
+O `--doctor` diz o que está faltando.
 
-## Ferramentas
+## O que dá para fazer
 
-Status/projeto: `premiere_status`, `get_project`, `list_project_items`, `get_item_info`,
-`import_media`, `replace_media`, `manage_bins`, `manage_project_items`, `project_file`.
+75 ferramentas agrupadas por área, cada uma com um parâmetro `action` quando faz várias coisas.
+A tabela completa, gerada do próprio servidor, está em [docs/TOOLS.md](docs/TOOLS.md).
 
-Sequências: `list_sequences`, `open_sequence`, `create_sequence`, `manage_sequence`,
-`sequence_tools` (subsequence, Auto Reframe, Scene Edit Detection).
+| Área | Ferramentas principais |
+|---|---|
+| Projeto e mídia | `get_project`, `project_file`, `import_media` (arquivos, pastas, FCP XML, AAF, .prproj, comps do AE), `media` (relink por busca, proxies via AME, interpretação, LUT de entrada, pasta vigiada), `project_tools` (backup, consolidate, smart bins, organizar bins), `metadata`, `search_items`, `inspect` |
+| Sequências | `create_sequence` (dimensões, .sqpreset, a partir de itens), `manage_sequence` (zero point, formato, propriedades), `sequence_tools` (nest/unnest, auto reframe, scene detection, previews), `checkpoint` (clone + diff + restore) |
+| Timeline | `place_clips` (dezenas de clipes com in/out, transform, efeitos e keyframes numa chamada), `edit_clips` (move, trim, slip, slide, roll, ripple trim, duplicate, freeze frame, lift/extract, J/L, rename em lote), `ripple_delete_ranges`, `razor`, `set_clip_speed` (rampa, optical flow), `source`, `markers`, `playhead` |
+| Efeitos e cor | `apply_effects`, `apply_effect_preset` (seus presets do .prfpset), `set_transform`, `add_keyframes`, `keyframe_tools`, `copy_effects` (colar atributos), `color` (Lumetri, match shot, auto balance, LUT), `stabilize`, `scopes`, `mask_fit` |
+| Áudio | `audio` (pan, gain, normalizar LUFS, ducking, beats, transientes, DeNoise/DeEsser...), `set_volume`, `fade_audio` |
+| Texto e legendas | `transcribe` (local, tempo por palavra), `captions` (SRT/VTT, retime, área segura por plataforma, legendas estilo Shorts com palavra destacada), `create_title_image` (templates e animação), `mogrt` (lote e receitas) |
+| Entrega | `export_frames`, `review`, `export_sequence`, `deliver` (matriz por plataforma, export em lote, por marcadores, conformidade com FFmpeg), `encode` (Media Encoder), `export_interchange` (XML, EDL, AAF, OMF, projeto) |
+| Automação | `auto_edit` (jump cut, vícios de fala, montagem no beat, zoom de ênfase, multicam, reframe por falante, Shorts, capítulos, mix, sincronizar áudio, conferência visual, edição por roteiro), `recipes`, `batch`, `undo`, `jobs` |
 
-Timeline: `get_timeline`, `manage_tracks`, `place_clips`, `find_clips`, `edit_clips`,
-`remove_clips`, `razor`, `set_clip_speed`, `close_gaps`, `select_clips`.
+## Exemplos de prompts
 
-Efeitos: `list_available_effects`, `get_clip_effects`, `apply_effects`, `remove_effects`,
-`set_properties`, `set_transform`, `add_keyframes`, `remove_keyframes`, `copy_effects`,
-`list_effect_presets`, `apply_effect_preset`, `add_transitions`.
-
-Áudio: `set_volume`, `fade_audio`. Marcadores: `markers`, `playhead`.
-
-Exportação: `export_frames`, `export_sequence`, `list_export_presets`, `export_interchange` (FCP XML / EDL / AAF).
-
-Gráficos: `create_title_image`, `mogrt`, `import_captions`. Análise: `analyze_media`.
-
-Avançado: `batch` (aceita os nomes das ferramentas), `run_extendscript`, `undo` (desfaz e refaz por chamada).
+- *"Monta a sequência com os clipes da pasta Cenas na ordem dos nomes, 3 s cada, com zoom de 100 para 106 em todos."*
+- *"Tira os silêncios da narração em A1 com 0,15 s de folga e põe zoom alternado nos cortes. Faz um checkpoint antes."*
+- *"Remove os 'é', 'tipo' e 'né' e as pausas acima de 0,8 s. Mostra o preview antes de cortar."*
+- *"Deixa a voz em -16 LUFS, abaixa a música embaixo da voz e entrega o mix em -14 LUFS / -1 dBTP."*
+- *"Corta os clipes da pasta B-roll no ritmo da música, a cada 2 batidas, com dissolve curto."*
+- *"Com as câmeras em V1 e V2 e os microfones em A1 e A2, alterna para quem está falando, no mínimo 2 s por plano."*
+- *"Faz 3 Shorts de 45 s dos melhores trechos, com legenda palavra por palavra e 'Inscreva-se' no fim, e exporta."*
+- *"Gera os capítulos do YouTube pela transcrição e me dá o texto da descrição."*
+- *"Sincroniza o áudio do gravador externo (D:/audio/externo.wav) com a câmera."*
+- *"Confere a timeline: frames pretos, flashes, gaps, clipes offline e legendas fora da área segura do Shorts."*
+- *"Monta uma sequência seguindo este roteiro: [frases]."*
+- *"Roda a receita canal_padrao na sequência Episódio 12."*
 
 ## Comportamento comum
 
-- **Clips linkados andam juntos.** `edit_clips` (move, trim), `remove_clips`, `razor` com `tracks`,
-  `set_clip_speed`, `set_volume` e `fade_audio` também agem no áudio linkado de um clip de vídeo
-  (e vice-versa). Use `include_linked: false` para mexer só no clip pedido.
-- **Validação antes de editar.** `place_clips` e `edit_clips` conferem start, in/out contra a duração
-  da mídia, track travada (`TRACK_LOCKED`) e efeitos antes de mexer na timeline. Se algo falha depois
-  da edição, o clip criado é removido.
-- **Sequência e projeto ativos preservados.** Uma ferramenta que recebe `sequence` devolve a sequência
-  ativa original no fim. Todas aceitam `project` (nome ou caminho de um projeto aberto); com mais de um
-  projeto aberto, `premiere_status` e `get_project` avisam.
-- **Diálogos do Premiere.** Enquanto uma chamada espera, o servidor (Windows) confere se o Premiere
-  abriu um diálogo. Logs informativos (AAF Export Log, Translation Report) são fechados e o texto volta
-  em `dialogsClosed`; outros diálogos que ficam abertos viram o erro `PREMIERE_DIALOG` com título e texto.
-- **Undo por chamada.** `undo {calls: N}` desfaz chamadas inteiras (passos do Premiere + edições de
-  trim/move, que não entram no histórico do Premiere); `undo {redo: true, calls: N}` refaz.
-- **Retorno compacto.** `get_timeline {compact: true}` devolve uma linha por clip
-  `[id, nome, start, end, in, out]`; `get_project {compact: true}` só conta as sequências.
+- **Envelope padrão:** toda resposta é `{ok, tool, status, data}` ou `{ok:false, tool, status:"failed", error:{code, message, hint}}`.
+  - `status` vale `verified` (estado relido bate com o pedido), `committed_unverified` (o Premiere aceitou, mas não dá para conferir), `ok` (leitura), `queued` (job) ou `needs_confirmation`.
+- **Seletor de clips em tudo:** id, lista de ids, ou `{tracks, name_regex, kind, selected, at, start_min, start_max, every_nth, offset, limit}`.
+- **Lote em tudo:** cada ferramenta de escrita aceita muitos alvos; `batch` junta várias ferramentas numa ida ao Premiere.
+- **Clips linkados juntos:** move, trim, speed, razor, remove e volume levam o áudio do vídeo (e vice-versa), salvo `include_linked: false`.
+- **Estado preservado:** a sequência e o projeto ativos voltam ao que eram quando a ferramenta trabalha em outra sequência.
+- **Guarda de projeto:** toda ferramenta aceita `project` (troca para esse projeto) e `expected_project_path` (falha com `PROJECT_MISMATCH` se o ativo for outro). Com vários projetos abertos, a resposta traz um aviso.
+- **Checkpoints:** `checkpoint: true` nas edições grandes clona a sequência como `[checkpoint hh:mm:ss]`; `checkpoint` faz diff (adicionados, removidos, movidos, aparados, alterados) e restore.
+- **Confirmação:** apagar sequência, ripple em 10+ clipes, fechar outros projetos e consolidar devolvem um preview e um `confirm_token` de uso único (`PREMIERE_MCP_CONFIRM=0` desliga).
+- **Jobs:** export, análise, transcrição, estabilização, proxies e edições automáticas aceitam `async: true`; `jobs` mostra progresso, ETA e resultado.
+- **Diálogos modais:** os logs conhecidos (AAF Export Log, Translation Report) são fechados sozinhos; qualquer outro diálogo vira `PREMIERE_DIALOG` com título e texto, em vez de travar.
+- **Undo por chamada:** `undo` desfaz chamadas inteiras (passos do Premiere e edições DOM), com redo.
+- **Permissões e packs:** perfis `inspect`, `edit`, `export`, `filesystem`, `unsafe-script` (o `run_extendscript` só existe com `unsafe-script`); packs `essential` (20 ferramentas, ~25 KB), `editing`, `audio`, `color`, `captions`, `delivery`, `full`. Ver [docs/CLIENTS.md](docs/CLIENTS.md).
+- **Backends:** `premiere_status` mostra CEP e UXP, a versão e a rota de cada ação. Uma escrita que falha num backend nunca é repetida no outro.
 
-## Limitações do Premiere 26.x
+## Desempenho
 
-| O quê | Comportamento | Código |
+`node bench/bench.mjs` num projeto limpo, Premiere 26.5.2, Windows 11. Resultados em `bench/results/`.
+
+| Operação | 2.0 (c92562b) | 2.0.1 (Fase 0) | 2.5 | Meta |
+|---|---|---|---|---|
+| place_clips, clipes simples (vídeo) | ~80 ms/clip | 58 | 38 | ≤ 40 ✓ |
+| place_clips, só áudio | — | 73 | 45 | — |
+| place_clips V+A com transform + keyframes | 214 ms/clip | 97 | 63 | ≤ 90 ✓ |
+| apply_effects | ~85 ms/clip | 96 | 26 | ≤ 40 ✓ |
+| get_timeline compacto, 500 clipes | 1,4–4,3 s | 1,05 s (400) | 495 ms (cache: 70 ms; 3 colunas: 254 ms) | ≤ 600 ms ✓ |
+| premiere_status | 40–130 ms | 38 | 24 | ≤ 40 ✓ |
+| tools/list, pack essential (20 ferramentas) | — | 81 KB (tudo) | 25,5 KB (24,96 KiB) | ≤ 25 KB ✓ |
+| tools/list, pack full (75 ferramentas) | 2,18 MB (original) | 81 KB (51) | 95,9 KB | — |
+
+Os tempos sobem quando há outros projetos ou abas de sequência abertos usando a mesma mídia (ex.: 63 ms/clip em vez de 38 com dois projetos abertos). Feche os outros projetos em lotes grandes.
+
+## Comparativo honesto com o leancoderkavy/premiere-pro-mcp (v1.30)
+
+**O que temos a mais**
+- Edições automáticas que **executam** (jump cut, vícios de fala, multicam, Shorts, mix com loudness verificado, sync, paper edit), onde ele tem ferramentas `plan_*` que só devolvem um plano.
+- Lote real: dezenas de clipes com in/out, transform, efeitos e keyframes numa chamada, contra um clipe por chamada.
+- Speed com ripple manual e linkados em sincronia, speed ramp, slip/slide/roll.
+- Transcrição local com tempo por palavra, legendas estilo Shorts e checagem de área segura.
+- Verificação de toda escrita (`status`), checkpoints e diff, undo por chamada, tokens de confirmação, perfis de permissão e packs, jobs assíncronos, detector de diálogos.
+- Contexto: 75 ferramentas (95 KB no pack completo, 25 KB no essential) contra ~450 + ~98 UXP.
+- Presets de efeito do usuário aplicados com keyframes, títulos PNG com fonte qualquer.
+
+**O que ainda falta**
+- O backend UXP tem poucas ações próprias (status, playhead, marcadores numa transação, script). As outras seguem pelo CEP. Ele ainda não foi testado ao vivo: precisa reiniciar o Premiere depois do `--install-uxp`.
+- Importar OTIO (só existe na API UXP).
+- Ler as legendas de uma caption track já existente na sequência: lemos de arquivos e transcrições.
+- Lumetri avançado (curvas, HSL secundário, color wheels): só básico, criativo e vinheta.
+- Ler a fila interna do Media Encoder: acompanhamos só os jobs iniciados por aqui.
+- Testado só no Premiere 26.5.2 no Windows (ver matriz).
+
+## Limitações do Premiere 26.x (e o código de erro usado)
+
+| Limitação | Código / comportamento |
+|---|---|
+| Work area não muda por script | `WORK_AREA_UNSUPPORTED` (use in/out) |
+| Scene Edit Detection não cria nada | corte detectado com FFmpeg (`method: "ffmpeg"`) |
+| Sem exportador EDL nativo | EDL CMX3600 gerado pela timeline |
+| Criar Adjustment Layer | `UNSUPPORTED_IN_PREMIERE` (reaproveita um que já exista no projeto) |
+| Time remapping por script | `UNSUPPORTED_IN_PREMIERE` (speed ramp por cortes) |
+| Look criativo do Lumetri por arquivo | `UNSUPPORTED_IN_PREMIERE` (use LUT de entrada ou preset) |
+| Poster frame, mapeamento de canais de áudio | `UNSUPPORTED_IN_PREMIERE` |
+| Clip gain é somente leitura | gain feito com o efeito Amplify |
+| Pan de clipe em track mono | `UNSUPPORTED_IN_PREMIERE` |
+| Texto de MOGRT nativo do Premiere | não editável; use `create_title_image` |
+| OTIO via ExtendScript | `UNSUPPORTED_IN_PREMIERE` |
+| Proxy com layout de áudio diferente | recusado pelo Premiere; o servidor remuxa o proxy e tenta de novo |
+| Fechar o último projeto aberto | pode derrubar o Premiere; os testes nunca fazem isso |
+
+## Matriz de compatibilidade
+
+| | Windows 11 | macOS |
 |---|---|---|
-| Work area por script | ignorada pelo Premiere; use in/out | `WORK_AREA_UNSUPPORTED` |
-| Scene Edit Detection | o Premiere não cria nada; o servidor detecta os cortes com FFmpeg | `method: "ffmpeg"` |
-| EDL | sem exportador; o servidor gera CMX3600 a partir da timeline | — |
-| Texto de MOGRT nativo do Premiere | não editável por script | aviso no retorno |
-| Fechar o último projeto aberto por script | pode derrubar o Premiere; os testes não fazem isso | — |
+| Premiere Pro 2026 (26.5.2) | testado ao vivo (todos os e2e) | não testado |
+| Premiere Pro 2025 / 2024 | não instalados nesta máquina: não testados | não testado |
+| UXP (25.6+) | plugin instalado; carregamento confirmado; rotas não testadas ao vivo | não testado |
+
+O código não usa APIs específicas de 2026 fora do UXP; versões 2022+ devem funcionar pelo CEP, mas não foram testadas.
 
 ## Testes
 
 ```bash
-npm test                              # ES3 (palavras reservadas, ternário encadeado) + smoke MCP
-node tests/e2e-premiere.mjs <pasta>   # 123 operações reais no Premiere aberto, conferidas relendo a timeline
-node tests/e2e-bugfixes.mjs           # regressão do primeiro relatório de bugs
-node bench/bench.mjs <pasta>          # velocidade num projeto limpo; resultado em bench/results/
+npm test                          # ES3 do host, sintaxe do painel, smoke MCP
+node tests/make-media.mjs         # mídia sintética (fala TTS, música 120 BPM, dois ângulos...)
+node tests/e2e-premiere.mjs       # base (123 testes)
+node tests/e2e-bugfixes.mjs       # regressão dos bugs antigos (18)
+node tests/e2e-phase1.mjs         # arquitetura (41)
+node tests/e2e-phase2.mjs         # paridade, uma checagem por ação (168)
+node tests/e2e-phase3.mjs         # edições automáticas (63)
+node bench/bench.mjs              # desempenho
 ```
 
-Benchmark (Premiere 26.5.2, Windows 11, 100 clips, projeto limpo):
-
-| Operação | 2.0 (c92562b) | agora |
-|---|---|---|
-| `place_clips` vídeo | ~80 ms/clip | 58 ms/clip |
-| `place_clips` áudio | ~80 ms/clip | 73 ms/clip |
-| `place_clips` V+A com transform + keyframes | 214 ms/clip | 97 ms/clip |
-| `apply_effects` | ~85 ms/clip | 96 ms/clip |
-| `get_timeline` compact, 400 clips | — | 1,05 s |
-| `premiere_status` | 40–130 ms | 38 ms |
-
-Os números variam com o estado do Premiere: abas de sequência abertas que usam a mesma mídia e outros
-projetos abertos deixam as edições mais lentas. Para lotes de 10+ clips o `place_clips` fecha as abas
-durante o lote e reabre no fim.
+Os e2e criam o próprio projeto, mandam `expected_project_path` em toda chamada (nunca mexem em outro projeto aberto) e fecham o projeto no fim quando há outro aberto.
 
 ## Licença
 
-MIT.
+MIT. Baseado no `premiere-pro-mcp` de leancoderkavy (MIT).

@@ -9,7 +9,9 @@ config file is backed up next to itself as `*.bak-<timestamp>` first).
 
 - Windows 10/11 or macOS with **Adobe Premiere Pro 2022 or newer** (tested on 26.5.2).
 - **Node.js 20+** (`node -v`). If missing, ask the user to install it from nodejs.org.
-- Optional: **FFmpeg** on PATH for the `analyze_media` tool.
+- Optional: **FFmpeg** on PATH (analysis, delivery checks, automatic edits) and
+  **faster-whisper** (`pip install faster-whisper`, Python 3.9+) for local transcription.
+  `--doctor` reports both; the rest works without them.
 
 ## Steps
 
@@ -25,7 +27,9 @@ npm run setup
 1. Builds TypeScript to `dist/`.
 2. Copies the CEP extension to the user's CEP extensions folder
    (`%APPDATA%\Adobe\CEP\extensions\PremiereMCPPlus` on Windows) and enables
-   `PlayerDebugMode` for CSXS 9–13 so the unsigned extension loads.
+   `PlayerDebugMode` for CSXS 9–13 so the unsigned extension loads. Also copies
+   the UXP plugin to `%APPDATA%\Adobe\UXP\Plugins\External` and registers it
+   (Premiere 25.6+, optional; it loads after a Premiere restart).
 3. Adds a `premiere-pro-plus` server to every Claude Desktop config it finds
    (classic installer and the Microsoft Store/MSIX package).
 4. Registers the server in Claude Code (`claude mcp add --scope user`) if the
@@ -45,7 +49,9 @@ npm test                 # ES3 check of the host library + MCP smoke test
 node dist/index.js --doctor
 ```
 
-`--doctor` should print `panel heartbeat: alive` once Premiere Pro is running.
+`--doctor` checks Node, FFmpeg, faster-whisper, the CEP extension and its
+heartbeat, the UXP plugin, Media Encoder and the Premiere version. `CEP panel
+heartbeat` must be OK once Premiere Pro is running.
 If it says "not alive": restart Premiere Pro (the bridge auto-starts with it).
 The visible panel is in **Window > Extensions > Premiere MCP Plus**.
 
@@ -54,12 +60,16 @@ Then tell the user to **restart Claude Desktop** and **Premiere Pro**.
 ## Optional: live end-to-end test
 
 With Premiere open, this creates a throw-away project in the media folder
-(pass it as the argument) and runs 123 operations, each checked by re-reading
-the timeline. It closes its project at the end when another project is open.
+(pass it as the argument) and runs every operation, each checked by re-reading
+Premiere. It closes its project at the end when another project is open.
 
 ```bash
+node tests/make-media.mjs D:/mcp-plus-test     # synthetic media (FFmpeg + Windows speech)
 node tests/e2e-premiere.mjs D:/mcp-plus-test
-node bench/bench.mjs D:/mcp-plus-test      # speed on a clean project
+node tests/e2e-phase1.mjs D:/mcp-plus-test
+node tests/e2e-phase2.mjs D:/mcp-plus-test
+node tests/e2e-phase3.mjs D:/mcp-plus-test
+node bench/bench.mjs D:/mcp-plus-test          # speed on a clean project
 ```
 
 The folder needs a few media files; generate them with FFmpeg as in
@@ -70,7 +80,13 @@ projects open, edits are slower.
 
 ```bash
 node dist/index.js --uninstall-cep
+node dist/index.js --uninstall-uxp
 ```
 
 Then remove the `premiere-pro-plus` entry from the Claude Desktop config and run
 `claude mcp remove --scope user premiere-pro-plus`.
+
+## Other clients and bundles
+
+Cursor, Codex, VS Code, the Claude Code plugin and the Claude Desktop `.mcpb`
+bundle: see [docs/CLIENTS.md](docs/CLIENTS.md).

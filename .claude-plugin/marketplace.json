@@ -1,0 +1,11 @@
+{
+  "name": "premiere-pro-mcp-plus",
+  "owner": { "name": "kasseditor-oss" },
+  "plugins": [
+    {
+      "name": "premiere-pro-mcp-plus",
+      "source": "./",
+      "description": "Adobe Premiere Pro MCP server (CEP + UXP) with batch editing, automatic edits and verified delivery."
+    }
+  ]
+}
