@@ -20,3 +20,33 @@ if (bad.length) {
   process.exit(1);
 }
 console.log("es3 reserved-word check ok");
+
+// ExtendScript evaluates an unparenthesized chained conditional wrongly:
+// `a ? 1 : b ? 2 : 4` returns 2 when a is true. Require parentheses around a
+// conditional used as the "else" branch of another one.
+const { createRequire } = await import("node:module");
+let acorn = null;
+try {
+  acorn = createRequire(import.meta.url)("acorn");
+} catch {
+  console.log("acorn not installed locally; chained-ternary check skipped");
+}
+if (acorn) {
+  const src = fs.readFileSync(file, "utf-8");
+  const ast = acorn.parse(src, { ecmaVersion: 3, preserveParens: true, locations: true, allowReserved: true });
+  const chained = [];
+  (function visit(node) {
+    if (!node || typeof node.type !== "string") return;
+    if (node.type === "ConditionalExpression" && node.alternate.type === "ConditionalExpression") chained.push(node.alternate.loc.start.line);
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (Array.isArray(v)) v.forEach(visit);
+      else if (v && typeof v === "object" && typeof v.type === "string") visit(v);
+    }
+  })(ast);
+  if (chained.length) {
+    console.error("Chained ternary without parentheses (ExtendScript evaluates it wrongly) at lines:\n" + chained.map((l) => `${file}:${l}: ${lines[l - 1].trim()}`).join("\n"));
+    process.exit(1);
+  }
+  console.log("es3 chained-ternary check ok");
+}

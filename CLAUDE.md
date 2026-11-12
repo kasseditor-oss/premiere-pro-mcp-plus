@@ -15,7 +15,9 @@ Premiere Pro.
   - `titles.ts` PNG title renderer (resvg); `media.ts` FFmpeg/sharp helpers.
 - `host/premiere-lib.jsx` — ExtendScript library loaded into Premiere. **Must stay ES3**:
   no `let/const`, arrow functions, or reserved words as property names (`in`, `class`...).
-  `npm test` checks this with acorn `--ecma3`.
+  `npm test` checks this with acorn `--ecma3`. ExtendScript also evaluates an
+  unparenthesized chained ternary wrongly (`a ? 1 : b ? 2 : 3` returns 2 when `a`
+  is true): write `a ? 1 : (b ? 2 : 3)`. `scripts/check-es3.mjs` rejects the bad form.
 - `cep/` — CEP extension (panel + headless auto-start) that executes calls.
 
 ## Rules

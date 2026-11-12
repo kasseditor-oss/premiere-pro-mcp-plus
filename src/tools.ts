@@ -77,6 +77,17 @@ const transform = z.object({
   unit: z.enum(["px", "norm"]).optional(),
 });
 
+/** Create the folder an output goes to, or fail with a clear OUTPUT_PATH_INVALID error. */
+function ensureOutputDir(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e: any) {
+    const root = path.parse(dir).root;
+    const why = root && !fs.existsSync(root) ? `the drive ${root} does not exist` : e?.code === "EACCES" || e?.code === "EPERM" ? "access is denied" : e?.code || String(e?.message || e);
+    throw new BridgeError("OUTPUT_PATH_INVALID", `Cannot create the output folder ${dir}: ${why}.`, "Pass a path on an existing, writable drive.");
+  }
+}
+
 function compact(v: unknown): string {
   return JSON.stringify(v, (_k, x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : x));
 }
@@ -147,8 +158,12 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "get_item_info",
     "Project item info",
-    "Details of one project item: media path, duration, in/out, fps interpretation, markers count, optional XMP/project metadata.",
-    { item: z.string().describe("Node id, name, bin path or media path"), metadata: z.boolean().optional() },
+    "Details of one project item: media path, duration, in/out, fps interpretation, markers count. metadata: true adds parsed fields (name, timebase, video/audio in/out and duration, label, XMP timecode...); raw_xml: true adds the full project metadata and XMP XML.",
+    {
+      item: z.string().describe("Node id, name, bin path or media path"),
+      metadata: z.boolean().optional().describe("Parsed metadata fields"),
+      raw_xml: z.boolean().optional().describe("Also return the complete, untruncated XML"),
+    },
     ANN.read,
     (a) => call("get_item_info", a),
   );
@@ -293,7 +308,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "manage_sequence",
     "Edit sequence",
-    "Rename, duplicate, delete, change settings (frame size/fps/sample rate), or set in/out, work area and playhead.",
+    "Rename, duplicate, delete, change settings (frame size/fps/sample rate), or set in/out, work area and playhead. No in/out point reads as null. The work area is switched on before it is set and re-read; Premiere 26.x ignores scripted work area changes, which returns WORK_AREA_UNSUPPORTED (use in/out instead).",
     {
       action: z.enum(["rename", "duplicate", "delete", "settings", "get_settings", "range"]),
       sequence: seqArg,
@@ -319,7 +334,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "sequence_tools",
     "Sequence tools",
-    "Advanced sequence operations: nest a range into a subsequence, Auto Reframe to another aspect ratio (e.g. 9:16), or Scene Edit Detection on selected clips (markers or cuts).",
+    "Advanced sequence operations: nest a range into a subsequence, Auto Reframe to another aspect ratio (e.g. 9:16), or Scene Edit Detection on selected clips (markers or cuts). Premiere 26.x runs Scene Edit Detection without creating anything, so the server then detects the cuts with FFmpeg and adds sequence markers or razor cuts itself (method: ffmpeg).",
     {
       action: z.enum(["subsequence", "auto_reframe", "scene_edit_detection"]),
       sequence: seqArg,
@@ -335,10 +350,43 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       sensitivity: z.enum(["low", "medium", "high"]).optional(),
     },
     ANN.write,
-    (a) => {
+    async (a) => {
       if (a.action === "subsequence") return call("create_subsequence", a);
       if (a.action === "auto_reframe") return call("auto_reframe", a, 600000);
-      return call("scene_edit_detection", { ...a, action: a.detection_action }, 600000);
+      const act = a.detection_action === "cuts" ? "cuts" : "markers";
+      const res: any = await call("scene_edit_detection", { ...a, action: act }, 600000);
+      const sources: any[] = res.sources || [];
+      delete res.sources;
+      const found = act === "cuts" ? res.newClips?.length : res.markers?.length;
+      if (found) return { ...res, method: "premiere" };
+      // Premiere 26.x accepts performSceneEditDetectionOnSelection but creates
+      // nothing, so detect the cuts with FFmpeg and apply them ourselves.
+      const threshold = a.sensitivity === "high" ? 0.15 : a.sensitivity === "low" ? 0.5 : 0.3;
+      const frame = 1 / 30;
+      const markers: { time: number; name: string; comment: string }[] = [];
+      const cuts: { time: number; tracks: string[] }[] = [];
+      const skipped: string[] = [];
+      for (const s of sources) {
+        if (!s.media || !fs.existsSync(s.media) || s.reversed) {
+          skipped.push(`${s.id}: ${s.reversed ? "reversed clip" : "no media file"}`);
+          continue;
+        }
+        const times = await media.detectScenes(s.media, threshold);
+        for (const t of times) {
+          if (t <= s.in + frame || t >= s.out - frame) continue;
+          const seqT = Math.round((s.start + (t - s.in) / (s.speed || 1)) * 1000) / 1000;
+          if (seqT <= s.start + frame || seqT >= s.end - frame) continue;
+          if (act === "markers") markers.push({ time: seqT, name: "Scene cut", comment: `${path.basename(s.media)} @ ${t}s` });
+          else cuts.push({ time: seqT, tracks: s.tracks });
+        }
+      }
+      if (act === "markers") {
+        const added: any = markers.length ? await call("add_markers", { sequence: a.sequence, markers }) : { added: [] };
+        return { ok: true, action: act, method: "ffmpeg", threshold, markers: added.added, count: added.added.length, skipped: skipped.length ? skipped : undefined, note: "Premiere's Scene Edit Detection produced nothing; cuts were detected with FFmpeg and added as sequence markers." };
+      }
+      const made: any[] = [];
+      for (const c of cuts) made.push(await call("razor", { sequence: a.sequence, times: [c.time], tracks: c.tracks }));
+      return { ok: true, action: act, method: "ffmpeg", threshold, cutTimes: cuts.map((c) => c.time), cuts: made.reduce((n, r) => n + (r.cuts || 0), 0), skipped: skipped.length ? skipped : undefined, note: "Premiere's Scene Edit Detection produced nothing; cuts were detected with FFmpeg and razored on the clips' tracks." };
     },
   );
 
@@ -407,12 +455,16 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     transform: transform.optional(),
     effects: z.array(z.union([z.string(), z.object({ name: z.string(), params: z.record(z.string(), value).optional() })])).optional(),
     keyframes: z.array(animation).optional(),
+    properties: z
+      .array(z.object({ effect: z.string().optional(), property: z.string(), value, unit: z.enum(["px", "norm"]).optional() }))
+      .optional()
+      .describe("Static parameter values set after effects are added, e.g. {effect:'Gaussian Blur', property:'Amount', value:30}"),
     volume_db: z.number().optional(),
   });
   tool(
     "place_clips",
     "Place clips",
-    "Build a timeline in ONE call: place many project items (with source in/out, duration, track, video-only, transform, effects, keyframes, volume). Missing tracks are created automatically. This replaces the original MCP's slow one-clip-at-a-time edits and the FCP-XML workaround. Returns the new clip ids.",
+    "Build a timeline in ONE call: place many project items (with source in/out, duration, track, video-only, transform, effects, keyframes, volume). Missing tracks are created automatically. Each clip is validated before the timeline is touched (start >= 0, 0 <= in < out <= media length, known effects, valid tracks); if anything fails after the edit, that clip and its linked audio are removed, so an error never leaves a clip behind. Returns the new clip ids and per-clip errors.",
     {
       sequence: seqArg,
       clips: z.array(placement).min(1),
@@ -486,7 +538,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "razor",
     "Razor cut",
-    "Cut at one or many times, on all tracks or on given tracks.",
+    "Cut at one or many times, on all tracks or on given tracks. cuts counts the clips really split; times where no clip spans the cut (e.g. past the end of the sequence) are returned in skipped with a warning.",
     { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional() },
     ANN.write,
     (a) => call("razor", a),
@@ -495,8 +547,16 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "set_clip_speed",
     "Clip speed",
-    "Change clip speed / reverse (QE). Speed 2 = 200%: the clip keeps its media range and its timeline length becomes duration/speed (ripple optional). Works on razored pieces; the result is re-read from Premiere (speed, start/end, media in/out).",
-    { sequence: seqArg, clips: clipSelector, speed: z.number().positive(), reverse: z.boolean().optional(), ripple: z.boolean().optional(), maintain_pitch: z.boolean().optional() },
+    "Change clip speed / reverse (QE). Speed 2 = 200%: the clip keeps its media range and its timeline length becomes duration/speed (ripple optional). Linked clips (the audio of a video clip) get the same speed and reverse, so they stay in sync. Works on razored pieces, including ones that end at the end of the media; the result is re-read from Premiere (speed, start/end, media in/out) and lists the linked clips changed.",
+    {
+      sequence: seqArg,
+      clips: clipSelector,
+      speed: z.number().positive(),
+      reverse: z.boolean().optional(),
+      ripple: z.boolean().optional(),
+      maintain_pitch: z.boolean().optional(),
+      include_linked: z.boolean().optional().describe("Also change linked clips (default true)"),
+    },
     ANN.write,
     (a) => call("set_speed", a),
   );
@@ -730,6 +790,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     ANN.read,
     async (a) => {
       const folder = path.resolve(a.folder || scratch);
+      ensureOutputDir(folder);
       const pngPreset = media.findExportPresets("PNG Sequence \(Match Source\)").find((p) => !/Alpha/i.test(p.name) && /Premiere/i.test(p.path))?.path || media.findExportPresets("PNG").find((p) => !/Alpha/i.test(p.name))?.path;
       const res: any = await call("export_frame", { sequence: a.sequence, times: a.times, folder, png_preset: pngPreset }, 60000 + a.times.length * 15000);
       const frames = res.frames as { time: number; timecode: string; path: string | null }[];
@@ -767,45 +828,65 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "export_sequence",
     "Export sequence",
-    "Render the sequence to a file using an .epr preset — directly in Premiere (blocks until done) or queued in Adobe Media Encoder (non-blocking). Range: entire / in_out / work_area.",
+    "Render the sequence to a file using an .epr preset — directly in Premiere (blocks until done) or queued in Adobe Media Encoder. Range: entire / in_out / work_area. Media Encoder reads the saved project, so the project is saved before queueing; pass wait: true to block until AME has written the file.",
     {
       sequence: seqArg,
       output: z.string(),
       preset_path: z.string().optional().describe("Default: first 'Match Source - Adaptive High Bitrate' / H.264 preset found"),
       range: z.enum(["entire", "in_out", "work_area"]).optional(),
       use_media_encoder: z.boolean().optional(),
-      wait_timeout_s: z.number().optional().describe("Direct export timeout, default 1800"),
+      wait: z.boolean().optional().describe("use_media_encoder: wait until the file exists and is a valid media file (default false)"),
+      wait_timeout_s: z.number().optional().describe("Export timeout (direct, or AME with wait), default 1800"),
     },
     ANN.write,
     async (a) => {
       let preset = a.preset_path;
       if (!preset) {
         const list = media.findExportPresets("Match Source.*(High|Adaptive)|H\\.264");
-        preset = (list.find((p) => /Match Source/i.test(p.name)) || list[0])?.path;
+        // Prefer Premiere's H.264 (.mp4) "Match Source - Adaptive High Bitrate";
+        // AME's "H264 Match Source" preset writes QuickTime .mov.
+        const rank = (p: { name: string; source: string }) =>
+          (/^Match Source - Adaptive High Bitrate$/i.test(p.name) ? 0 : /^Match Source - High bitrate$/i.test(p.name) ? 1 : /Match Source/i.test(p.name) ? 2 : 3) * 2 + (p.source === "Premiere" ? 0 : 1);
+        preset = [...list].sort((x, y) => rank(x) - rank(y))[0]?.path;
         if (!preset) throw new Error("No export preset found; pass preset_path (see list_export_presets).");
       }
       // Transparent still used to pad a range that ends in a gap (see host export_media).
       const filler = path.join(bridge.dir, "mcp-filler.png");
       if (!fs.existsSync(filler)) await sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toFile(filler);
-      fs.mkdirSync(path.dirname(path.resolve(a.output)), { recursive: true });
+      ensureOutputDir(path.dirname(path.resolve(a.output)));
       const out = path.resolve(a.output);
       const timeout = (a.wait_timeout_s || 1800) * 1000;
       const run = () => call("export_media", { sequence: a.sequence, path: out, preset_path: preset, range: a.range, use_media_encoder: a.use_media_encoder, filler_path: filler, keep_temp: true }, timeout) as Promise<any>;
+      const startedAt = Date.now() - 2000;
       let res = await run();
-      if (res.queued) return res;
+      // The host renames the output to the preset's real extension (.mov...).
+      const actual: string = res.path || out;
+      if (res.queued) {
+        if (!a.wait) return res;
+        // Wait for AME: a new (or rewritten) file that ffprobe can read.
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+          if (fs.existsSync(actual) && fs.statSync(actual).mtimeMs > startedAt) {
+            const check = await media.waitForValidMedia(actual, Math.max(5_000, end - Date.now()));
+            if (check.valid) return { ...res, done: true, bytes: fs.statSync(actual).size, duration: check.duration };
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        throw new BridgeError("AME_TIMEOUT", `Media Encoder job ${res.jobId} did not produce ${actual} within ${Math.round(timeout / 1000)}s.`, "Check the Media Encoder queue for errors.");
+      }
       // Premiere can return before the file is finalized: wait until it is a valid media file.
-      let check = await media.waitForValidMedia(out, 120_000);
+      let check = await media.waitForValidMedia(actual, 120_000);
       if (!check.valid) {
         if (res.tempSequence) await call("delete_sequence", { sequence: res.tempSequence }).catch(() => undefined);
         res = await run(); // one retry
-        check = await media.waitForValidMedia(out, 180_000);
+        check = await media.waitForValidMedia(actual, 180_000);
       }
       if (res.tempSequence) {
         await call("delete_sequence", { sequence: res.tempSequence }).catch(() => undefined);
         delete res.tempSequence;
       }
       if (!check.valid) throw new Error(`Premiere wrote an incomplete file (${check.reason}). Keep the Premiere window visible and retry, or use use_media_encoder: true.`);
-      return { ...res, bytes: fs.statSync(out).size, duration: check.duration };
+      return { ...res, bytes: fs.statSync(actual).size, duration: check.duration };
     },
   );
 
@@ -823,7 +904,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     ANN.write,
     async (a) => {
       const p = path.resolve(a.path);
-      fs.mkdirSync(path.dirname(p), { recursive: true });
+      ensureOutputDir(path.dirname(p));
       if (a.format === "fcp_xml") return call("export_fcp_xml", { sequence: a.sequence, path: p }, 120000);
       if (a.format === "edl") {
         const r: any = await call("export_edl", { sequence: a.sequence, path: p }, 120000);
@@ -932,7 +1013,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     ANN.read,
     async (a) => {
       const f = path.resolve(a.file);
-      if (!fs.existsSync(f)) throw new Error(`File not found: ${f}`);
+      if (!fs.existsSync(f)) throw new BridgeError("FILE_NOT_FOUND", `File not found: ${f}`, "Check the path (absolute paths are safest).");
       switch (a.action) {
         case "probe":
           return media.probe(f);
@@ -961,7 +1042,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "run_extendscript",
     "Run ExtendScript",
-    "Escape hatch: run ExtendScript (ES3) in Premiere. The code is a function body; use `return` to send back a JSON-serializable value. `H` exposes every host handler and `helpers` has getSequence/selectClips/resolveItem/tsec.",
+    "Escape hatch: run ExtendScript in Premiere. The code is a function body; use `return` to send back a JSON-serializable value. `H` exposes every host handler and `helpers` has getSequence/selectClips/resolveItem/tsec. The language is ES3: no let/const, arrow functions, template strings, Array.map/forEach or JSON object. Reserved words cannot be literal keys: `{in: 1}` fails with \"Illegal use of reserved word 'in'\"; write `o[\"in\"] = 1` (same for class, default, new...).",
     { code: z.string() },
     ANN.destructive,
     (a) => call("eval_script", a, 120000),
@@ -976,7 +1057,22 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     (a) => call("batch", a, 300000),
   );
 
-  tool("undo", "Undo / redo", "Undo or redo the last N Premiere actions.", { steps: z.number().int().min(1).max(50).optional(), redo: z.boolean().optional() }, ANN.write, (a) =>
-    call(a.redo ? "redo" : "undo", a),
+  tool(
+    "undo",
+    "Undo / redo",
+    "Undo whole tool calls with calls: N (recommended): one tool call can push several Premiere undo steps (set_clip_speed does), and DOM edits like trims and moves never reach Premiere's undo stack, so the server records both per call and rewinds them together. steps: N is Premiere's raw undo (Ctrl+Z) N times. history: true lists the recorded calls. Undoing by calls stops with UNDO_STACK_CHANGED if the project was edited by hand since.",
+    {
+      calls: z.number().int().min(1).max(50).optional().describe("Undo the last N tool calls"),
+      steps: z.number().int().min(1).max(50).optional().describe("Raw Premiere undo steps"),
+      redo: z.boolean().optional().describe("Redo raw steps"),
+      history: z.boolean().optional().describe("List the recorded calls instead of undoing"),
+    },
+    ANN.write,
+    (a) => {
+      if (a.history) return call("undo_history", {});
+      if (a.redo) return call("redo", a);
+      if (a.calls === undefined && a.steps === undefined) return call("undo", { calls: 1 });
+      return call("undo", a);
+    },
   );
 }
