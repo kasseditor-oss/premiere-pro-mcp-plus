@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
-import { BridgeError, PremiereBridge } from "./bridge.js";
+import { BridgeError, PremiereBridge, packageRoot } from "./bridge.js";
+import { registerPhase2 } from "./tools2.js";
+import { registerPhase3 } from "./tools3.js";
 import { WIDGET_URI } from "./branding.js";
 import { findPreset, loadPresets } from "./presets.js";
 import { renderTitle } from "./titles.js";
@@ -242,6 +244,22 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     );
   }
   const call = (fn: string, args: object, timeoutMs?: number) => bridge.call(fn, args as Record<string, unknown>, { timeoutMs });
+  // Capability routing: an action goes to UXP when the plugin is connected and its
+  // probe reports the API; otherwise CEP/QE. A write that fails on one backend is
+  // never retried on the other (the error carries the backend).
+  const UXP_ROUTES: Record<string, string> = { "markers.add": "markers.add", "playhead.set": "playhead.set" };
+  async function viaUxp(action: string): Promise<boolean> {
+    if (process.env.PREMIERE_MCP_PREFER_UXP === "0" || !bridge.uxp.connected) return false;
+    const p = await bridge.uxp.probe();
+    return !!p?.capabilities?.[UXP_ROUTES[action]];
+  }
+  const uxpCall = async (fn: string, args: object) => {
+    try {
+      return { ...(await bridge.uxp.call(fn, args as any)), backend: "uxp" };
+    } catch (e: any) {
+      throw new BridgeError(e.code || "UXP_ERROR", `${e.message} (UXP backend; not retried on CEP)`, e.hint);
+    }
+  };
 
   // ======================================================== status
   tool("premiere_status", "Premiere status", "Check the connection to Premiere Pro and get version, open project, active sequence, bridge health. Call first when unsure.", {}, ANN.read, async () => {
@@ -249,7 +267,9 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     if (!hb.alive) return { connected: false, bridgeDir: bridge.dir, heartbeatAgeMs: hb.ageMs, fix: "Open Premiere Pro (extension auto-starts). If never installed: run `premiere-pro-mcp-plus --install-cep` and restart Premiere." };
     const [ping, dialogs] = await Promise.all([call("ping", {}, 15000) as Promise<any>, bridge.openDialogs()]);
     const res: any = { connected: true, ...ping, busy: hb.busy, commandsServed: hb.count };
-    res.backends = { cep: { connected: true, lib: ping.lib }, uxp: { state: bridge.uxp.state, port: bridge.uxp.port } };
+    const probe = await bridge.uxp.probe();
+    res.backends = { cep: { connected: true, lib: ping.lib }, uxp: { state: bridge.uxp.state, port: bridge.uxp.port, version: probe?.version, capabilities: probe?.capabilities } };
+    res.routes = Object.fromEntries(Object.entries(UXP_ROUTES).map(([k, cap]) => [k, probe?.capabilities?.[cap] ? "uxp" : "cep"]));
     if (dialogs.length) res.dialogs = dialogs.map((d) => ({ title: d.title, text: d.text.slice(0, 300) }));
     if (ping.projects && ping.projects.length > 1) res.warning = `${ping.projects.length} projects are open; tools act on the active one (${ping.project?.name}). Close the others or pass project to choose.`;
     return res;
@@ -298,12 +318,22 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       mirror_folders_as_bins: z.boolean().optional(),
       bin: z.string().optional().describe("Target bin path (created if missing)"),
       as_image_sequence: z.boolean().optional(),
+      interchange: z
+        .object({ kind: z.enum(["fcp_xml", "edl", "aaf", "prproj", "ae_comps", "otio"]), path: z.string(), comps: z.array(z.string()).optional(), sequence_ids: z.array(z.string()).optional() })
+        .optional()
+        .describe("Import a timeline/project: FCP XML, EDL, AAF, a whole .prproj or its sequence_ids, After Effects comps (all, or comps by name). OTIO needs the UXP backend."),
     },
     ANN.write,
-    async (a) => {
-      if (!a.paths?.length && !a.folder) throw new Error("Pass paths or folder.");
+    async (a: any) => {
+      if (a.interchange) {
+        const k = a.interchange;
+        if (k.kind === "otio") throw new BridgeError("UNSUPPORTED_IN_PREMIERE", "OTIO import is only available through Premiere's UXP API (25.6+), not ExtendScript.", "Export OTIO to FCP XML (e.g. with opentimelineio's otioconvert) and import that.");
+        const kind = k.kind === "ae_comps" ? "ae_comps" : k.kind === "prproj" && k.sequence_ids?.length ? "sequences" : "file";
+        return call("import_special", { kind, path: path.resolve(k.path), comps: k.comps, sequence_ids: k.sequence_ids, bin: a.bin }, 600000);
+      }
+      if (!a.paths?.length && !a.folder) throw new Error("Pass paths, folder or interchange.");
       const results: any[] = [];
-      if (a.paths?.length) results.push(await call("import_files", { paths: a.paths.map((p) => path.resolve(p)), bin: a.bin, as_image_sequence: a.as_image_sequence }, 300000));
+      if (a.paths?.length) results.push(await call("import_files", { paths: a.paths.map((p: string) => path.resolve(p)), bin: a.bin, as_image_sequence: a.as_image_sequence }, 300000));
       if (a.folder) {
         const files = media.listMediaFiles(path.resolve(a.folder), !!a.recursive);
         const groups = new Map<string, string[]>();
@@ -424,7 +454,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "create_sequence",
     "Create sequence",
-    "Create a sequence without any dialog: from explicit settings (e.g. 1080x1920 @30 for Shorts), from a .sqpreset, or matching a clip's settings (optionally empty).",
+    "Create a sequence without any dialog: from explicit settings (e.g. 1080x1920 @30 for Shorts), from a .sqpreset, matching a clip's settings (optionally empty), or from a list of project items placed in order (from_items).",
     {
       name: z.string(),
       width: z.number().int().optional(),
@@ -434,10 +464,11 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       preset_path: z.string().optional(),
       from_clip: z.string().optional().describe("Project item to match"),
       empty: z.boolean().optional().describe("With from_clip: remove the clip after creating"),
+      from_items: z.array(z.string()).optional().describe("Build the sequence from these project items, in order (settings from the first)"),
       bin: z.string().optional(),
     },
     ANN.write,
-    (a) => call("create_sequence", a, 60000),
+    (a) => (a.from_items?.length ? call("sequence_from_clips", { name: a.name, items: a.from_items, bin: a.bin }, 120000) : call("create_sequence", a, 60000)),
   );
 
   tool(
@@ -445,9 +476,18 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     "Edit sequence",
     "Rename, duplicate, delete, change settings (frame size/fps/sample rate), or set in/out, work area and playhead. No in/out point reads as null. The work area is switched on before it is set and re-read; Premiere 26.x ignores scripted work area changes, which returns WORK_AREA_UNSUPPORTED (use in/out instead).",
     {
-      action: z.enum(["rename", "duplicate", "delete", "settings", "get_settings", "range"]),
+      action: z.enum(["rename", "duplicate", "delete", "settings", "get_settings", "range", "zero_point", "format", "custom_property"]),
       sequence: seqArg,
       activate: z.boolean().optional().describe("duplicate: make the copy the active sequence (default false keeps the original active)"),
+      seconds: z.number().optional().describe("zero_point: starting time (s)"),
+      display_format: z.number().int().optional().describe("format: timecode display (e.g. 101 = 30 fps non-drop, 102 = 29.97 drop)"),
+      field_type: z.number().int().optional().describe("format: 0 progressive, 1 upper, 2 lower"),
+      par: z.string().optional().describe('format: pixel aspect ratio, e.g. "1,1"'),
+      audio_channel_type: z.number().int().optional().describe("format: 0 mono, 1 stereo, 2 5.1, 3 multichannel"),
+      max_bit_depth: z.boolean().optional(),
+      max_render_quality: z.boolean().optional(),
+      prop_name: z.string().optional().describe("custom_property: id"),
+      prop_value: z.string().optional(),
       name: z.string().optional(),
       width: z.number().int().optional(),
       height: z.number().int().optional(),
@@ -461,6 +501,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     },
     ANN.destructive,
     (a) => {
+      if (a.action === "zero_point" || a.action === "format") return call("sequence_extra", a);
+      if (a.action === "custom_property") return call("sequence_extra", { ...a, name: a.prop_name, value: a.prop_value });
       const map: Record<string, string> = { rename: "rename_sequence", duplicate: "duplicate_sequence", delete: "delete_sequence", settings: "set_sequence_settings", get_settings: "get_sequence_settings", range: "set_sequence_range" };
       return call(map[a.action], a);
     },
@@ -476,9 +518,11 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "sequence_tools",
     "Sequence tools",
-    "Advanced sequence operations: nest a range into a subsequence, Auto Reframe to another aspect ratio (e.g. 9:16), or Scene Edit Detection on selected clips (markers or cuts). Premiere 26.x runs Scene Edit Detection without creating anything, so the server then detects the cuts with FFmpeg and adds sequence markers or razor cuts itself (method: ffmpeg).",
+    "Advanced sequence operations: nest clips in place (their range on their tracks becomes a nested sequence), unnest (put a nest's clips back; effects not carried), render_previews / delete_previews, nest a range into a subsequence, Auto Reframe to another aspect ratio (e.g. 9:16), or Scene Edit Detection on selected clips (markers or cuts). Premiere 26.x runs Scene Edit Detection without creating anything, so the server then detects the cuts with FFmpeg and adds sequence markers or razor cuts itself (method: ffmpeg).",
     {
-      action: z.enum(["subsequence", "auto_reframe", "scene_edit_detection"]),
+      action: z.enum(["subsequence", "auto_reframe", "scene_edit_detection", "nest", "unnest", "render_previews", "delete_previews"]),
+      include_linked: z.boolean().optional(),
+      audio: z.boolean().optional().describe("render_previews: audio only"),
       sequence: seqArg,
       activate: z.boolean().optional().describe("auto_reframe: make the new sequence active (default false keeps the original active)"),
       name: z.string().optional(),
@@ -494,6 +538,9 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     ANN.write,
     async (a) => {
       if (a.action === "subsequence") return call("create_subsequence", a);
+      if (a.action === "nest") return call("nest_clips", a, 120000);
+      if (a.action === "unnest") return call("unnest_clip", a, 300000);
+      if (a.action === "render_previews" || a.action === "delete_previews") return call("sequence_extra", a, 3600000);
       if (a.action === "auto_reframe") return call("auto_reframe", a, 600000);
       const act = a.detection_action === "cuts" ? "cuts" : "markers";
       const res: any = await call("scene_edit_detection", { ...a, action: act }, 600000);
@@ -557,7 +604,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     "Tracks",
     "Add video/audio tracks, delete a track, or set mute/lock/target/name on tracks.",
     {
-      action: z.enum(["add", "delete", "set"]),
+      action: z.enum(["add", "delete", "set", "target_all", "target_none"]),
       sequence: seqArg,
       video: z.number().int().optional().describe("add: number of video tracks"),
       audio: z.number().int().optional().describe("add: number of audio tracks"),
@@ -572,6 +619,10 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     ANN.destructive,
     async (a) => {
       if (a.action === "add") return call("add_tracks", a);
+      if (a.action === "target_all" || a.action === "target_none") {
+        const tl: any = await call("get_timeline", { sequence: a.sequence, compact: true, skip_empty: false });
+        return call("set_track", { sequence: a.sequence, tracks: tl.tracks.map((t: any) => t.track), target: a.action === "target_all" });
+      }
       if (a.action === "delete") {
         const out = [];
         // delete from the highest index down so indices stay valid
@@ -633,11 +684,21 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "edit_clips",
     "Edit clips",
-    "Move (by delta or to a time), move to another track, trim (start/end/in/out/duration, or trim_start/trim_end amounts), enable/disable, rename, color label, link/unlink. move and trim also move/trim the linked clips (include_linked, default true) and are checked before editing (media range, locked tracks); link needs 2+ clips, unlink takes one clip of the group.",
+    "Move (by delta or to a time), move to another track, trim (start/end/in/out/duration, or trim_start/trim_end; keyframe_policy), enable/disable, rename, color label, link/unlink; slip / slide / roll by delta (s); ripple_trim an edge; duplicate (with effects); freeze_frame (hold the frame at 'at' for duration s); lift_range / extract_range (start..end); split_edit (J/L cut: audio_lead / audio_tail); batch_rename with a pattern. move and trim also move/trim the linked clips (include_linked, default true) and are checked before editing (media range, locked tracks); link needs 2+ clips, unlink takes one clip of the group.",
     {
-      action: z.enum(["move", "move_to_track", "trim", "set", "link", "unlink"]),
+      action: z.enum(["move", "move_to_track", "trim", "set", "link", "unlink", "slip", "slide", "roll", "ripple_trim", "duplicate", "freeze_frame", "lift_range", "extract_range", "split_edit", "batch_rename"]),
       sequence: seqArg,
-      clips: clipSelector,
+      clips: clipSelector.optional(),
+      edge: z.enum(["start", "end"]).optional().describe("ripple_trim: which edge"),
+      at: z.number().optional().describe("freeze_frame: sequence time of the frame (default the clip start)"),
+      gap: z.number().optional().describe("duplicate: seconds after the original (default 0)"),
+      ripple: z.boolean().optional().describe("freeze_frame: push later clips (default true)"),
+      tracks: z.array(z.string()).optional().describe("lift_range / extract_range: tracks (default all)"),
+      audio_lead: z.number().optional().describe("split_edit: audio starts this many s earlier (J cut)"),
+      audio_tail: z.number().optional().describe("split_edit: audio ends this many s later (L cut)"),
+      pattern: z.string().optional().describe('batch_rename: e.g. "Cena {n:02}" ({n}, {n:02}, {name}, {track})'),
+      start_number: z.number().int().optional(),
+      keyframe_policy: z.enum(["keep", "reject", "keep_relative"]).optional().describe("trim: keep (default), reject when keys fall outside the new range, keep_relative (shift keys with a trimmed start)"),
       delta: z.number().optional(),
       to: z.number().optional(),
       track: track.optional(),
@@ -654,8 +715,50 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true"),
     },
     ANN.write,
-    (a) => {
+    async (a: any) => {
+      if (!a.clips && !["lift_range", "extract_range"].includes(a.action)) throw new BridgeError("BAD_ARGS", "clips is required.");
       switch (a.action) {
+        case "slip":
+        case "slide":
+        case "roll":
+          return call("edit_qe", a, 120000);
+        case "ripple_trim":
+        case "duplicate":
+        case "lift_range":
+        case "split_edit":
+        case "batch_rename":
+          return call("edit_misc", { ...a, start: a.start }, 120000);
+        case "extract_range":
+          return call("ripple_delete_ranges", { sequence: a.sequence, ranges: [{ start: a.start, end: a.end }], tracks: a.tracks }, 300000);
+        case "freeze_frame": {
+          const src: any = await call("clip_media", { sequence: a.sequence, clips: a.clips });
+          const c = src.clips.find((x: any) => x.video);
+          if (!c) throw new BridgeError("BAD_ARGS", "freeze_frame needs a video clip.");
+          const at = a.at ?? c.start;
+          const pngPreset = media.findExportPresets("PNG Sequence \\(Match Source\\)").find((p) => !/Alpha/i.test(p.name) && /Premiere/i.test(p.path))?.path;
+          const fr: any = await call("export_frame", { sequence: a.sequence, times: [at], folder: path.join(bridge.dir, "freeze"), png_preset: pngPreset }, 60000);
+          const still = fr.frames?.[0]?.path;
+          if (!still) throw new BridgeError("FRAME_EXPORT_FAILED", "Could not render the frame to freeze.", fr.hint);
+          return call("edit_misc", { ...a, clips: c.id, at, still_path: still }, 120000);
+        }
+        case "trim":
+          if (a.keyframe_policy && a.keyframe_policy !== "keep") {
+            const before: any = await call("get_clip_effects", { sequence: a.sequence, clips: a.clips, include_values: true, limit: 50 });
+            const keyed = before.clips.flatMap((c: any) => c.components.flatMap((comp: any) => (comp.props || []).filter((p: any) => p.keyframes?.length).map((p: any) => ({ id: c.id, effect: comp.name, property: p.name, keys: p.keyframes.map((k: any) => k.t) }))));
+            if (a.keyframe_policy === "reject" && keyed.length) {
+              const dur: any = await call("find_clips", { sequence: a.sequence, clips: a.clips });
+              const lens = new Map(dur.clips.map((c: any) => [c.id, c.end - c.start]));
+              const ts0 = a.trim_start || 0;
+              const newLen = (id: string) => (a.duration ?? (lens.get(id) as number) - ts0 - (a.trim_end || 0));
+              const outside = keyed.filter((k: any) => k.keys.some((t: number) => t < ts0 - 0.001 || t - ts0 > newLen(k.id) + 0.001));
+              if (outside.length) throw new BridgeError("KEYFRAMES_OUTSIDE", `Trim would leave keyframes outside ${outside.length} clip(s) (e.g. ${outside[0].property}).`, "Use keyframe_policy keep_relative or keep, or move the keys first (keyframe_tools).");
+            }
+            const r: any = await call("trim_clips", a);
+            if (a.keyframe_policy === "keep_relative" && a.trim_start)
+              for (const k of keyed) await call("keyframe_tools", { sequence: a.sequence, clips: k.id, effect: k.effect, property: k.property, action: "move", delta: -a.trim_start }).catch(() => undefined);
+            return { ...r, keyframePolicy: a.keyframe_policy, keyedProperties: keyed.length };
+          }
+          return call("trim_clips", a);
         case "move":
           return call("move_clips", a);
         case "move_to_track":
@@ -709,14 +812,39 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     {
       sequence: seqArg,
       clips: clipSelector,
-      speed: z.number().positive(),
+      speed: z.number().positive().optional(),
       reverse: z.boolean().optional(),
       ripple: z.boolean().optional(),
       maintain_pitch: z.boolean().optional(),
       include_linked: z.boolean().optional().describe("Also change linked clips (default true)"),
+      interpolation: z.enum(["frame_sampling", "frame_blending", "optical_flow"]).optional(),
+      frame_blend: z.boolean().optional(),
+      ramp: z.array(z.object({ at: z.number().describe("seconds from the clip start"), speed: z.number().positive() })).optional().describe("Speed ramp: the clip is cut at each 'at' and each piece gets its speed (time remapping is not scriptable); ripple keeps the pieces together"),
     },
     ANN.write,
-    (a) => call("set_speed", a),
+    async (a: any) => {
+      if (a.ramp?.length) {
+        const c: any = (await call("find_clips", { sequence: a.sequence, clips: a.clips })).clips.find((x: any) => !x.track.startsWith("A")) || (await call("find_clips", { sequence: a.sequence, clips: a.clips })).clips[0];
+        const pts = [...a.ramp].sort((x: any, y: any) => x.at - y.at);
+        const cuts = pts.map((p: any) => c.start + p.at).filter((t: number) => t > c.start + 0.02 && t < c.end - 0.02);
+        if (cuts.length) await call("razor", { sequence: a.sequence, times: cuts, tracks: [c.track] });
+        // Re-find the pieces left to right and set each speed (from the last piece back so ripple stays simple).
+        const pieces: any = await call("find_clips", { sequence: a.sequence, clips: { tracks: [c.track], start_min: c.start - 0.01, start_max: c.end } });
+        const list = pieces.clips.filter((x: any) => x.start >= c.start - 0.01 && x.start < c.end - 0.01).sort((x: any, y: any) => x.start - y.start);
+        const speedAt = (rel: number) => { let s = a.speed; for (const p of pts) if (rel >= p.at - 0.02) s = p.speed; return s; };
+        const done: any[] = [];
+        for (let i = list.length - 1; i >= 0; i--) {
+          const sp = speedAt(list[i].start - c.start);
+          if (Math.abs(sp - 1) < 1e-6) { done.unshift({ id: list[i].id, speed: 1 }); continue; }
+          const r: any = await call("set_speed", { sequence: a.sequence, clips: list[i].id, speed: sp, ripple: a.ripple !== false, include_linked: a.include_linked, maintain_pitch: a.maintain_pitch });
+          done.unshift({ id: r.clips[0]?.id, speed: r.clips[0]?.speed, start: r.clips[0]?.start, end: r.clips[0]?.end });
+        }
+        return { ramp: done, pieces: done.length, verified: done.every((d, i) => Math.abs((d.speed || 1) - speedAt(list[i].start - c.start)) < 0.01) };
+      }
+      const out: any = a.speed ? await call("set_speed", a) : {};
+      if (a.interpolation || a.frame_blend !== undefined) out.interpolation = await call("time_interpolation", a);
+      return out;
+    },
     { checkpoint: true },
   );
 
@@ -826,9 +954,17 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     "copy_effects",
     "Copy effects",
     "Paste-attributes: copy effects, Motion/Opacity values and keyframes from one clip to others. keyframe_mode 'stretch' rescales key times to each target's length.",
-    { sequence: seqArg, from: z.string().describe("Source clip id"), to: clipSelector, include_motion: z.boolean().optional(), keyframe_mode: z.enum(["relative", "stretch"]).optional() },
+    {
+      sequence: seqArg,
+      from: z.string().describe("Source clip id"),
+      to: clipSelector,
+      include_motion: z.boolean().optional(),
+      keyframe_mode: z.enum(["relative", "stretch"]).optional(),
+      attributes: z.array(z.enum(["motion", "opacity", "volume", "effects", "time_remapping"])).optional().describe("Paste Attributes: what to copy (default everything)"),
+      effects: z.array(z.string()).optional().describe("With attributes 'effects': only these effects"),
+    },
     ANN.write,
-    (a) => call("copy_effects", a, 120000),
+    (a) => (a.attributes || a.effects ? call("paste_attributes", a, 120000) : call("copy_effects", a, 120000)),
   );
 
   // ======================================================== presets (new)
@@ -912,11 +1048,17 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "markers",
     "Markers",
-    "List, add (batch) or delete sequence markers, or clip markers of a project item.",
+    "Sequence markers (or a project item's clip markers): list (filter by type/color), add (batch), delete, update (name, comment, color, duration, time, type), export (CSV or YouTube chapters text), import (CSV/TXT client notes with timecodes).",
     {
-      action: z.enum(["list", "add", "delete"]),
+      action: z.enum(["list", "add", "delete", "update", "export", "import"]),
       sequence: seqArg,
       item: z.string().optional().describe("Use the project item's clip markers instead"),
+      guid: z.string().optional().describe("update: marker guid (or match by time / name_regex)"),
+      update: z.object({ name: z.string().optional(), comment: z.string().optional(), color: z.number().int().min(0).max(7).optional(), duration: z.number().optional(), time: z.number().optional(), type: z.enum(["comment", "chapter", "segmentation", "web"]).optional(), url: z.string().optional() }).optional(),
+      type: z.enum(["comment", "chapter", "segmentation", "web"]).optional().describe("list/export: only this type"),
+      color: z.number().int().optional().describe("list/export: only this color"),
+      format: z.enum(["csv", "youtube"]).optional().describe("export: CSV, or YouTube chapters text (00:00 Title)"),
+      path: z.string().optional().describe("export: file to write; import: CSV/TXT with timecodes (time,name,comment or 'mm:ss Title' lines)"),
       markers: z
         .array(z.object({ time: z.number(), name: z.string().optional(), comment: z.string().optional(), duration: z.number().optional(), color: z.number().int().min(0).max(7).optional(), type: z.enum(["comment", "chapter", "segmentation", "web"]).optional(), url: z.string().optional() }))
         .optional(),
@@ -926,11 +1068,69 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       to: z.number().optional(),
     },
     ANN.write,
-    (a) => call(a.action === "list" ? "list_markers" : a.action === "add" ? "add_markers" : "delete_markers", a),
+    async (a: any) => {
+      if (a.action === "update") return call("update_markers", a);
+      if (a.action === "add") {
+        const simple = !a.item && (a.markers || []).every((m: any) => !m.type && m.color === undefined && !m.url);
+        if (simple && (await viaUxp("markers.add"))) return uxpCall("add_markers", a);
+        return call("add_markers", a);
+      }
+      if (a.action === "delete") return call("delete_markers", a);
+      if (a.action === "import") {
+        if (!a.path) throw new BridgeError("BAD_ARGS", "path is required.");
+        const txt = fs.readFileSync(path.resolve(a.path), "utf-8").replace(/\r/g, "");
+        const tc = (s: string) => { const p = s.trim().split(/[:;.]/).map(Number); if (p.some(isNaN)) return NaN; return p.length === 4 ? p[0] * 3600 + p[1] * 60 + p[2] + p[3] / 30 : p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p.length === 2 ? p[0] * 60 + p[1] : p[0]; };
+        const markers: any[] = [];
+        for (const line of txt.split("\n")) {
+          if (!line.trim()) continue;
+          let m = /^\s*([\d:;.]+)\s*[,;\t]\s*([^,;\t]*)(?:[,;\t]\s*(.*))?$/.exec(line) || /^\s*([\d:;.]+)\s+(.*)$/.exec(line);
+          if (!m) continue;
+          const t = tc(m[1]);
+          if (isNaN(t)) continue;
+          markers.push({ time: t, name: (m[2] || "").trim(), comment: (m[3] || "").trim() || undefined, type: a.type });
+        }
+        if (!markers.length) throw new BridgeError("BAD_FILE", "No 'time, name[, comment]' lines found.");
+        return call("add_markers", { sequence: a.sequence, item: a.item, markers });
+      }
+      const r: any = await call("list_markers", a);
+      let list = r.markers as any[];
+      if (a.type) list = list.filter((m) => String(m.type).toLowerCase().includes(a.type));
+      if (a.color !== undefined) list = list.filter((m) => m.color === a.color);
+      if (a.action === "list") return { markers: list, count: list.length };
+      const mmss = (t: number) => { const s = Math.floor(t); const h = Math.floor(s / 3600); const m = Math.floor(s / 60) % 60; const x = String(s % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${String(m).padStart(2, "0")}:${x}`; };
+      let text: string;
+      if (a.format === "youtube") {
+        const ch = [...list].sort((x, y) => x.start - y.start);
+        if (!ch.length || ch[0].start > 0.5) ch.unshift({ start: 0, name: "Intro" });
+        text = ch.map((m) => `${mmss(m.start)} ${m.name || "Chapter"}`).join("\n");
+      } else text = "time,end,name,comment,type,color\n" + list.map((m) => [m.start, m.end, m.name, m.comment, m.type, m.color].map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+      if (a.path) { ensureOutputDir(path.dirname(path.resolve(a.path))); fs.writeFileSync(path.resolve(a.path), text, "utf-8"); }
+      return { format: a.format || "csv", markers: list.length, text: text.slice(0, 5000), path: a.path ? path.resolve(a.path) : undefined, warning: a.format === "youtube" && list.length < 3 ? "YouTube needs at least 3 chapters, the first at 00:00, each >= 10 s." : undefined };
+    },
   );
 
-  tool("playhead", "Playhead", "Get or set the playhead position (seconds).", { sequence: seqArg, seconds: z.number().optional() }, ANN.write, (a) =>
-    a.seconds === undefined ? call("get_playhead", a) : call("set_playhead", a),
+  tool(
+    "playhead",
+    "Playhead and playback",
+    "Get or set the playhead (seconds), or action: next_edit / prev_edit (on tracks), next_marker / prev_marker, clip (go to a clip's start or edge 'end'), start, end, play (speed), stop, workspace (list, or switch with name).",
+    {
+      sequence: seqArg,
+      seconds: z.number().optional(),
+      action: z.enum(["next_edit", "prev_edit", "next_marker", "prev_marker", "clip", "start", "end", "play", "stop", "workspace"]).optional(),
+      tracks: z.array(z.string()).optional(),
+      clip: z.string().optional(),
+      edge: z.enum(["start", "end"]).optional(),
+      speed: z.number().optional(),
+      name: z.string().optional().describe("workspace name"),
+    },
+    ANN.write,
+    async (a: any) => {
+      if (a.action === "workspace") return call("workspace", a);
+      if (a.action) return call("navigate", a);
+      if (a.seconds === undefined) return call("get_playhead", a);
+      if (await viaUxp("playhead.set")) return uxpCall("set_playhead", a);
+      return call("set_playhead", a);
+    },
   );
 
   // ======================================================== export
@@ -1000,8 +1200,9 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     },
     ANN.write,
     async (a) => {
-      // Fail fast on an unknown sequence (before scanning preset folders).
-      if (a.sequence) await call("get_sequence_settings", { sequence: a.sequence }, 15000);
+      // Fail fast on an unknown or empty sequence (before scanning preset folders).
+      const seqInfo: any = await call("get_sequence_settings", { sequence: a.sequence }, 15000);
+      if (!(seqInfo.duration > 0)) throw new BridgeError("EMPTY_SEQUENCE", `Sequence '${seqInfo.name}' is empty; nothing to export.`, "Place clips first.");
       let preset = a.preset_path;
       if (!preset) {
         const list = media.findExportPresets("Match Source.*(High|Adaptive)|H\\.264");
@@ -1056,10 +1257,10 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "export_interchange",
     "Export XML / EDL / AAF",
-    "Export the sequence as Final Cut Pro XML (no 'Translation Report' dialog), CMX3600 EDL, or AAF. Missing folders are created. When Premiere has no EDL exporter (26.x), the EDL is generated from the timeline (video_track + audio_tracks).",
+    "Export the sequence as Final Cut Pro XML (no 'Translation Report' dialog), CMX3600 EDL, AAF, OMF (audio), or a .prproj with just this sequence (project). Missing folders are created. When Premiere has no EDL exporter (26.x), the EDL is generated from the timeline (video_track + audio_tracks).",
     {
       sequence: seqArg,
-      format: z.enum(["fcp_xml", "edl", "aaf"]),
+      format: z.enum(["fcp_xml", "edl", "aaf", "omf", "project"]),
       path: z.string(),
       video_track: track.optional().describe("EDL: video track to list (default V1)"),
       audio_tracks: z.array(z.string()).optional().describe('EDL: audio tracks (default ["A1","A2"])'),
@@ -1069,6 +1270,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       const p = path.resolve(a.path);
       ensureOutputDir(path.dirname(p));
       if (a.format === "fcp_xml") return call("export_fcp_xml", { sequence: a.sequence, path: p }, 120000);
+      if (a.format === "omf" || a.format === "project") return call("export_extra", { sequence: a.sequence, path: p, format: a.format }, 600000);
       if (a.format === "edl") {
         const r: any = await call("export_edl", { sequence: a.sequence, path: p }, 120000);
         if (r.nativeExport) return { path: p, generator: "premiere" };
@@ -1116,18 +1318,51 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       y: z.number().optional(),
       line_gap: z.number().optional(),
       shadow: z.union([z.literal(false), z.object({ dx: z.number().optional(), dy: z.number().optional(), blur: z.number().optional(), color: z.string().optional(), opacity: z.number().optional() })]).optional(),
+      template: z.enum(["lower_third", "center_title", "counter", "chapter_tag"]).optional().describe("Ready layouts: lower_third (name + role bottom-left), center_title, counter (big number, e.g. rankings), chapter_tag (top-left tag)"),
+      animate: z.object({ in: z.enum(["fade", "slide_up", "slide_left", "pop"]).optional(), out: z.enum(["fade", "slide_down", "slide_right", "pop"]).optional(), duration: z.number().optional() }).optional().describe("With place: entrance/exit keyframes (Opacity / Position / Scale)"),
       place: z.object({ sequence: seqArg, track: track.optional(), start: z.number(), duration: z.number().optional(), bin: z.string().optional() }).optional(),
       preview: z.boolean().optional().describe("Return the image (default true)"),
     },
     ANN.write,
     async (a) => {
-      const r = renderTitle({ ...a, output: path.resolve(a.output) } as any);
+      const spec: any = { ...a, output: path.resolve(a.output) };
+      const W = a.width ?? 1920;
+      const H = a.height ?? 1080;
+      const L = a.lines;
+      if (a.template === "lower_third") Object.assign(spec, { align: "left", x: a.x ?? W * 0.06, y: a.y ?? H * 0.8, line_gap: a.line_gap ?? 8, lines: L.map((l: any, i: number) => ({ size: i ? H * 0.035 : H * 0.06, color: i ? "#DDDDDD" : "#FFFFFF", ...l, underline: i === 0 ? l.underline ?? { color: "#46C8FF" } : l.underline })) });
+      if (a.template === "center_title") Object.assign(spec, { align: "center", lines: L.map((l: any, i: number) => ({ size: i ? H * 0.05 : H * 0.11, ...l })) });
+      if (a.template === "counter") Object.assign(spec, { align: "center", y: a.y ?? H * 0.6, lines: L.map((l: any, i: number) => ({ size: i ? H * 0.06 : H * 0.3, stroke_color: "#000000", stroke_width: H * 0.008, ...l })) });
+      if (a.template === "chapter_tag") Object.assign(spec, { align: "left", x: a.x ?? W * 0.04, y: a.y ?? H * 0.1, lines: L.map((l: any) => ({ size: H * 0.045, letter_spacing: 2, ...l })), shadow: a.shadow ?? { dx: 3, dy: 3, blur: 3 } });
+      const r = renderTitle(spec as any);
       const out: any = { title: r };
       if (a.place) {
         const imp: any = await call("import_files", { paths: [r.path], bin: a.place.bin || "_MCP Plus/Titles" });
         const id = imp.imported[0]?.id;
         if (!id) throw new Error("Title was rendered but not imported.");
         out.placed = await call("place_clips", { sequence: a.place.sequence, clips: [{ item: id, track: a.place.track || "V2", start: a.place.start, duration: a.place.duration ?? 3 }] });
+        const clipId = (out.placed as any).placed?.[0]?.id;
+        if (a.animate && clipId) {
+          const d = a.animate.duration ?? 0.4;
+          const W2 = (await call("get_sequence_settings", { sequence: a.place.sequence }) as any);
+          const cx = W2.width / 2;
+          const cy = W2.height / 2;
+          const anims: any[] = [];
+          const op: any[] = [];
+          const pos: any[] = [];
+          const sc: any[] = [];
+          if (a.animate.in === "fade") op.push({ t: 0, v: 0 }, { t: d, v: 100 });
+          if (a.animate.in === "slide_up") pos.push({ t: 0, v: [cx, cy + W2.height * 0.08] }, { t: d, v: [cx, cy], interp: "ease" });
+          if (a.animate.in === "slide_left") pos.push({ t: 0, v: [cx + W2.width * 0.1, cy] }, { t: d, v: [cx, cy], interp: "ease" });
+          if (a.animate.in === "pop") sc.push({ t: 0, v: 0 }, { t: d * 0.7, v: 110 }, { t: d, v: 100 });
+          if (a.animate.out === "fade") op.push({ t: "end", offset: d, v: 100 }, { t: "end", v: 0 });
+          if (a.animate.out === "slide_down") pos.push({ t: "end", offset: d, v: [cx, cy] }, { t: "end", v: [cx, cy + W2.height * 0.08] });
+          if (a.animate.out === "slide_right") pos.push({ t: "end", offset: d, v: [cx, cy] }, { t: "end", v: [cx + W2.width * 0.1, cy] });
+          if (a.animate.out === "pop") sc.push({ t: "end", offset: d, v: 100 }, { t: "end", v: 0 });
+          if (op.length) anims.push({ effect: "Opacity", property: "Opacity", keys: op });
+          if (pos.length) anims.push({ property: "Position", unit: "px", keys: pos });
+          if (sc.length) anims.push({ property: "Scale", keys: sc });
+          if (anims.length) out.animation = await call("add_keyframes", { sequence: a.place.sequence, clips: clipId, animations: anims });
+        }
       }
       const content: Content[] = [{ type: "text", text: compact(out) }];
       if (a.preview !== false) content.push({ type: "image", data: await media.toPreviewJpeg(r.path, 640), mimeType: "image/jpeg" });
@@ -1138,11 +1373,16 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "mogrt",
     "Motion Graphics Templates",
-    "Import a .mogrt onto the timeline (with text/params filled in), read its editable params, or set params (text, colors, numbers) on existing MOGRT clips.",
+    "Import a .mogrt onto the timeline (with text/params filled in; save_recipe keeps it for reuse), batch (many MOGRTs or recipes with different params in one call), read its editable params, or set params on existing MOGRT clips. Premiere's native text MOGRTs do not expose their text to scripts: use create_title_image for those.",
     {
-      action: z.enum(["import", "get_params", "set_params"]),
+      action: z.enum(["import", "get_params", "set_params", "batch"]),
       sequence: seqArg,
       path: z.string().optional(),
+      items: z
+        .array(z.object({ path: z.string().optional(), recipe: z.string().optional(), track: track.optional(), start: z.number(), duration: z.number().optional(), params: z.record(z.string(), value).optional() }))
+        .optional()
+        .describe("batch: many MOGRTs (or saved recipes) with their own params in one call"),
+      save_recipe: z.string().optional().describe("import: also save path + params as a reusable recipe with this name"),
       track: track.optional(),
       start: z.number().optional(),
       duration: z.number().optional(),
@@ -1150,8 +1390,24 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       params: z.record(z.string(), value).optional().describe('e.g. {"Text": "Hello", "Color": "#46C8FF"}'),
     },
     ANN.write,
-    (a) => {
-      if (a.action === "import") return call("import_mogrt", { ...a, path: a.path ? path.resolve(a.path) : undefined }, 120000);
+    async (a: any) => {
+      const recipesFile = path.join(bridge.dir, "mogrt-recipes.json");
+      const recipes: Record<string, any> = fs.existsSync(recipesFile) ? JSON.parse(fs.readFileSync(recipesFile, "utf-8")) : {};
+      if (a.action === "batch") {
+        const out: any[] = [];
+        for (const it of a.items || []) {
+          const r = it.recipe ? recipes[it.recipe] : null;
+          if (it.recipe && !r) { out.push({ start: it.start, error: `Unknown recipe ${it.recipe}` }); continue; }
+          const spec = { sequence: a.sequence, path: path.resolve(it.path || r.path), track: it.track || r?.track, start: it.start, duration: it.duration ?? r?.duration, params: { ...(r?.params || {}), ...(it.params || {}) } };
+          try { out.push({ start: it.start, ...(await call("import_mogrt", spec, 120000)) }); } catch (e: any) { out.push({ start: it.start, error: e.message, code: e.code }); }
+        }
+        return { results: out, placed: out.filter((o) => !o.error).length, failed: out.filter((o) => o.error).length, verified: out.every((o) => !o.error) };
+      }
+      if (a.action === "import") {
+        const r: any = await call("import_mogrt", { ...a, path: a.path ? path.resolve(a.path) : undefined }, 120000);
+        if (a.save_recipe) { recipes[a.save_recipe] = { path: path.resolve(a.path), track: a.track, duration: a.duration, params: a.params }; fs.writeFileSync(recipesFile, JSON.stringify(recipes, null, 1)); r.recipe = a.save_recipe; }
+        return r;
+      }
       if (a.action === "get_params") return call("get_mogrt_params", a);
       return call("set_mogrt_params", a);
     },
@@ -1389,4 +1645,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       return out;
     },
   );
+
+  const ctx: any = { tool, call, ANN, seqArg, clipSelector, track, scratch, ensureOutputDir, bridge, jobs, packageRoot, registry: toolRegistry, makeCheckpoint, server };
+  registerPhase2(ctx);
+  registerPhase3(ctx);
 }

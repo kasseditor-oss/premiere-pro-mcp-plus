@@ -26,7 +26,7 @@ function createServer() {
   const bridge = sharedBridge();
   const server = new McpServer(
     { name: "premiere-pro-plus", title: "Premiere Pro", version: VERSION, icons: icons(), websiteUrl: "https://www.adobe.com/products/premiere.html" } as any,
-    { capabilities: { tools: {}, resources: {} }, instructions: INSTRUCTIONS } as any,
+    { capabilities: { tools: {}, resources: {}, prompts: {} }, instructions: INSTRUCTIONS } as any,
   );
   server.registerResource(
     "premiere-activity",

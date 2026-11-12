@@ -2911,6 +2911,1056 @@
   }
   H.scene_sources = function (a) { var s = getSequence(a.sequence); return { sources: sceneSources(s, selectClips(s, a.clips || {})) }; };
 
+
+  // ================================================================ PHASE 2
+  // ---- 2.1 inspection
+  // Every timeline use of every project item: { nodeId: [{sequence, track, start}] }.
+  function mediaUses() {
+    var uses = {}, seqs = allSequences();
+    for (var i = 0; i < seqs.length; i++) {
+      var s = seqs[i];
+      eachClip(s, function (c, label) {
+        var pi = null;
+        try { pi = c.projectItem; } catch (e) {}
+        if (!pi) return;
+        var id = String(pi.nodeId);
+        if (!uses[id]) uses[id] = [];
+        if (uses[id].length < 20) uses[id].push({ sequence: s.name, track: label, start: r3(tsec(c.start)) });
+        else uses[id].more = (uses[id].more || 0) + 1;
+      });
+    }
+    return uses;
+  }
+  function mediaItems() {
+    var out = [];
+    walk(requireProject().rootItem, "", function (it, path) {
+      if (it.type === 2) return;
+      var t = itemType(it);
+      if (t === "sequence" || isHelperBin(path)) return;
+      out.push({ it: it, path: path || "/" });
+    });
+    return out;
+  }
+  H.inspect_media = function (a) {
+    var mode = a.mode || "used", uses = mediaUses(), items = mediaItems(), out = [], limit = a.limit || 200;
+    if (mode === "duplicates") {
+      var byPath = {};
+      for (var i = 0; i < items.length; i++) {
+        var mp = lower(itemMediaPath(items[i].it));
+        if (!mp) continue;
+        if (!byPath[mp]) byPath[mp] = [];
+        byPath[mp].push(describeItem(items[i].it, items[i].path));
+      }
+      for (var k in byPath) if (byPath.hasOwnProperty(k) && byPath[k].length > 1) out.push({ media: byPath[k][0].media, items: byPath[k] });
+      return { duplicates: out.slice(0, limit), count: out.length };
+    }
+    for (var j = 0; j < items.length; j++) {
+      var it = items[j].it, id = String(it.nodeId), u = uses[id], off = false;
+      try { off = !!it.isOffline(); } catch (eO) {}
+      if (mode === "used" && !u) continue;
+      if (mode === "unused" && u) continue;
+      if (mode === "offline" && !off) continue;
+      var d = describeItem(it, items[j].path);
+      if (u) { d.uses = u.length + (u.more || 0); if (a.detail) d.where = u; }
+      if (off) d.offline = true;
+      out.push(d);
+    }
+    var res = { mode: mode, count: out.length, items: out.slice(0, limit) };
+    if (out.length > limit) res.truncated = true;
+    return res;
+  };
+  H.timeline_summary = function (a) {
+    var s = getSequence(a.sequence), end = parseFloat(s.end) / TPS, tracks = [], fx = {}, disabled = [], offline = [], speed = [], gaps = [];
+    var minGap = has(a, "min_gap") ? a.min_gap : 1 / fps(s) + 0.0005;
+    var groups = [[s.videoTracks, true], [s.audioTracks, false]];
+    for (var g = 0; g < groups.length; g++) {
+      for (var t = 0; t < groups[g][0].numTracks; t++) {
+        var tr = groups[g][0][t], label = trackLabel(groups[g][1], t), cov = 0, cursor = 0, n = tr.clips.numItems, tg = [];
+        for (var i = 0; i < n; i++) {
+          var c = tr.clips[i], cs = tsec(c.start), ce = tsec(c.end);
+          cov += ce - cs;
+          if (cs - cursor > minGap && (i > 0 || a.leading_gaps)) tg.push({ start: r3(cursor), end: r3(cs), duration: r3(cs - cursor) });
+          if (ce > cursor) cursor = ce;
+          try { if (c.disabled) disabled.push({ id: String(c.nodeId), name: c.name, track: label, start: r3(cs) }); } catch (e1) {}
+          try { if (c.projectItem && c.projectItem.isOffline()) offline.push({ id: String(c.nodeId), name: c.name, track: label, start: r3(cs) }); } catch (e2) {}
+          var sp = clipSpeed(c);
+          if (Math.abs(sp - 1) > 0.0001) speed.push({ id: String(c.nodeId), name: c.name, track: label, speed: sp });
+          try { for (var k = 0; k < c.components.numItems; k++) { var cp = c.components[k]; if (!isBuiltIn(cp)) fx[cp.displayName] = (fx[cp.displayName] || 0) + 1; } } catch (e3) {}
+        }
+        if (!n) continue;
+        for (var q = 0; q < tg.length; q++) { tg[q].track = label; gaps.push(tg[q]); }
+        tracks.push({ track: label, clips: n, coverage: end > 0 ? r3(cov / end) : 0, gaps: tg.length });
+      }
+    }
+    var res = summarizeSequence(s);
+    res.tracks = tracks;
+    res.effects = fx;
+    res.gaps = a.mode === "gaps" ? gaps : gaps.length;
+    if (a.mode !== "gaps") { res.disabled = disabled; res.offline = offline; res.speedChanged = speed; }
+    try { res.markers = s.markers.numMarkers; } catch (e4) {}
+    if (a.mode === "gaps" || a.detail) res.gapList = gaps.slice(0, a.limit || 200);
+    return res;
+  };
+  H.search_items = function (a) {
+    var re = a.regex ? new RegExp(a.regex, "i") : null, q = a.name ? lower(a.name) : null;
+    var exts = a.extensions ? asArray(a.extensions) : null, types = a.types ? asArray(a.types) : null;
+    var uses = has(a, "used") ? mediaUses() : null, out = [], limit = a.limit || 200;
+    walk(a.bin ? binByPath(a.bin, false) : requireProject().rootItem, a.bin || "", function (it, path) {
+      var t = itemType(it);
+      if (types && !inList(types, t)) return;
+      if (q && lower(it.name).indexOf(q) < 0) return;
+      if (re && !re.test(it.name)) return;
+      var mp = itemMediaPath(it);
+      if (exts) { var ok = false; for (var i = 0; i < exts.length; i++) if (lower(mp).match(new RegExp("\\." + String(exts[i]).replace(/^\./, "") + "$", "i"))) ok = true; if (!ok) return; }
+      if (has(a, "label")) { var lb = -1; try { lb = it.getColorLabel(); } catch (e) {} if (lb !== a.label) return; }
+      if (has(a, "offline")) { var off = false; try { off = !!it.isOffline(); } catch (e2) {} if (off !== !!a.offline) return; }
+      if (uses && t !== "bin") { var used = !!uses[String(it.nodeId)]; if (used !== !!a.used) return; }
+      if (out.length < limit) out.push(describeItem(it, path, !!a.detail));
+      else out.truncated = true;
+    });
+    return { items: out, count: out.length, truncated: out.truncated || undefined };
+  };
+  function inList(list, v) { for (var i = 0; i < list.length; i++) if (list[i] === v) return true; return false; }
+  H.inspect_state = function (a) {
+    var res = H.ping({});
+    try {
+      var s = app.project.activeSequence;
+      if (s) {
+        res.sequence = summarizeSequence(s);
+        var sel = selectClips(s, { selected: true }), ids = [];
+        for (var i = 0; i < sel.length && i < 50; i++) ids.push({ id: String(sel[i].clip.nodeId), name: sel[i].clip.name, track: sel[i].track });
+        res.selection = ids;
+        var tv = [], ta = [];
+        for (var v = 0; v < s.videoTracks.numTracks; v++) try { if (s.videoTracks[v].isTargeted()) tv.push("V" + (v + 1)); } catch (e1) {}
+        for (var au = 0; au < s.audioTracks.numTracks; au++) try { if (s.audioTracks[au].isTargeted()) ta.push("A" + (au + 1)); } catch (e2) {}
+        res.targeted = tv.concat(ta);
+      }
+      var vs = app.getProjectViewIDs ? app.getProjectViewIDs() : null;
+      if (vs && vs.length) { var ps = app.getProjectViewSelection(vs[0]), list = []; if (ps) for (var k = 0; k < ps.length && k < 50; k++) list.push({ id: String(ps[k].nodeId), name: ps[k].name }); res.projectSelection = list; }
+    } catch (e) {}
+    return res;
+  };
+  // Clip details: effects with values/keyframes, linked clips, source item, markers of the item.
+  H.inspect_clip = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
+    var fx = H.get_clip_effects({ sequence: a.sequence, clips: a.clips, include_values: a.detail !== false, limit: a.limit || 5 }).clips;
+    for (var i = 0; i < list.length && i < (a.limit || 5); i++) {
+      var c = list[i].clip, d = clipInfo(c, list[i].track, list[i].index, { media: true });
+      var ls = linkedEntries(s, c), li = [];
+      for (var k = 0; k < ls.length; k++) li.push({ id: String(ls[k].clip.nodeId), track: ls[k].track });
+      d.linked = li;
+      d.components = fx[i] ? fx[i].components : [];
+      try { var pi = c.projectItem; if (pi) { d.itemName = pi.name; var ms = pi.getMarkers(); d.itemMarkers = ms ? ms.numMarkers : 0; } } catch (e) {}
+      try { d.adjustmentLayer = !!c.isAdjustmentLayer(); d.mogrt = !!c.isMGT(); } catch (e2) {}
+      out.push(d);
+    }
+    return { clips: out };
+  };
+
+  // ---- 2.11 metadata (XMP and project panel columns)
+  var PROJ_NS = "http://ns.adobe.com/premierePrivateProjectMetaData/1.0/";
+  function xmpLib() {
+    if (typeof XMPMeta === "undefined") { try { if (ExternalObject.AdobeXMPScript === undefined) ExternalObject.AdobeXMPScript = new ExternalObject("lib:AdobeXMPScript"); } catch (e) {} }
+    if (typeof XMPMeta === "undefined") fail("XMP_UNAVAILABLE", "The XMP scripting library is not available in this Premiere.");
+  }
+  // Friendly field names -> [namespace, property]. Log Note, Scene, Shot, Take,
+  // Description and Good are the fields the Metadata panel shows for clips.
+  function xmpField(name) {
+    var n = normName(name);
+    var map = {
+      lognote: [XMPConst.NS_DM, "logComment"], logcomment: [XMPConst.NS_DM, "logComment"],
+      scene: [XMPConst.NS_DM, "scene"], shot: [XMPConst.NS_DM, "shotName"], shotname: [XMPConst.NS_DM, "shotName"],
+      take: [XMPConst.NS_DM, "takeNumber"], good: [XMPConst.NS_DM, "good"], description: [XMPConst.NS_DC, "description"],
+      title: [XMPConst.NS_DC, "title"], creator: [XMPConst.NS_DC, "creator"], rating: [XMPConst.NS_XMP, "Rating"], comment: [XMPConst.NS_DM, "comment"]
+    };
+    return map[n] || null;
+  }
+  var SENSITIVE = /GPS|Serial|Owner|Creator|Author|Artist|Copyright|Lens|Make|Model|Location|City|Country|Email|Phone/i;
+  function readXmp(it, includeSensitive) {
+    xmpLib();
+    var x = new XMPMeta(it.getXMPMetadata()), out = {}, hidden = 0;
+    var iter = x.iterator(XMPConst.ITERATOR_JUST_LEAFNODES | XMPConst.ITERATOR_OMIT_QUALIFIERS);
+    var n = 0;
+    while (n < 400) {
+      var p = iter.next();
+      if (!p) break;
+      n++;
+      var path = String(p.path), v = String(p.value);
+      if (!path || v === "") continue;
+      if (!includeSensitive && SENSITIVE.test(path)) { hidden++; continue; }
+      out[path] = v.length > 200 ? v.substring(0, 200) + "..." : v;
+    }
+    return { fields: out, hidden: hidden };
+  }
+  H.metadata = function (a) {
+    var act = a.action || "get", items = asArray(a.items), out = [];
+    if (act === "add_field") {
+      var ok = requireProject().addPropertyToProjectMetadataSchema(a.field, a.field_label || a.field, has(a, "type") ? a.type : 2);
+      return { field: a.field, added: !!ok };
+    }
+    if (!items.length) fail("BAD_ARGS", "Pass items (project item ids or names).");
+    for (var i = 0; i < items.length; i++) {
+      var it = resolveItem(items[i]), d = { id: String(it.nodeId), name: it.name };
+      if (act === "get") {
+        var r = readXmp(it, !!a.include_sensitive);
+        var friendly = {};
+        var names = ["Log Note", "Scene", "Shot", "Take", "Description", "Good"];
+        xmpLib();
+        var x0 = new XMPMeta(it.getXMPMetadata());
+        for (var k = 0; k < names.length; k++) { var f = xmpField(names[k]); var pv = null; if (f[1] === "description" || f[1] === "title") { try { pv = x0.getLocalizedText(f[0], f[1], null, "x-default"); } catch (e1) {} } else { try { pv = x0.getProperty(f[0], f[1]); } catch (e0) {} } if (pv !== null && pv !== undefined && String(pv) !== "") friendly[names[k]] = String(pv); }
+        d.fields = friendly;
+        if (a.detail) { d.xmp = r.fields; if (r.hidden) d.hiddenSensitive = r.hidden; }
+        try { var lb = it.getColorLabel(); d.label = lb; } catch (e2) {}
+        if (a.fields) {
+          var pm = new XMPMeta(it.getProjectMetadata()), custom = {};
+          var fl = asArray(a.fields);
+          for (var c = 0; c < fl.length; c++) { var cv = null; try { cv = pm.getProperty(PROJ_NS, fl[c]); } catch (e3) {} if (cv !== null && cv !== undefined) custom[fl[c]] = String(cv); }
+          d.custom = custom;
+        }
+      } else if (act === "set") {
+        xmpLib();
+        var vals = a.values || {}, x = new XMPMeta(it.getXMPMetadata()), setx = [], custom2 = [], pm2 = null;
+        for (var key in vals) {
+          if (!vals.hasOwnProperty(key)) continue;
+          var fx = xmpField(key);
+          if (fx) {
+            if (fx[1] === "description" || fx[1] === "title") x.setLocalizedText(fx[0], fx[1], null, "x-default", String(vals[key]));
+            else if (fx[1] === "creator") { try { x.deleteProperty(fx[0], fx[1]); } catch (eD) {} x.appendArrayItem(fx[0], fx[1], String(vals[key]), 0, XMPConst.ARRAY_IS_ORDERED); }
+            else x.setProperty(fx[0], fx[1], String(vals[key]));
+            setx.push(key);
+          } else {
+            if (!pm2) pm2 = new XMPMeta(it.getProjectMetadata());
+            pm2.setProperty(PROJ_NS, key, String(vals[key]));
+            custom2.push(key);
+          }
+        }
+        if (setx.length) it.setXMPMetadata(x.serialize());
+        if (custom2.length) it.setProjectMetadata(pm2.serialize(), custom2);
+        // verify
+        var chk = new XMPMeta(it.getXMPMetadata()), bad = [];
+        for (var s2 = 0; s2 < setx.length; s2++) {
+          var f2 = xmpField(setx[s2]), got = null;
+          try { got = (f2[1] === "description" || f2[1] === "title") ? chk.getLocalizedText(f2[0], f2[1], null, "x-default") : (f2[1] === "creator" ? chk.getArrayItem(f2[0], f2[1], 1) : chk.getProperty(f2[0], f2[1])); } catch (eG) {}
+          if (String(got) !== String(vals[setx[s2]])) bad.push(setx[s2]);
+        }
+        d.set = setx.concat(custom2);
+        if (bad.length) d.notVerified = bad;
+      } else if (act === "label") {
+        it.setColorLabel(a.label);
+        d.label = it.getColorLabel();
+      }
+      out.push(d);
+    }
+    var res = { items: out };
+    if (act !== "get") { var allOk = true; for (var z = 0; z < out.length; z++) if (out[z].notVerified || (act === "label" && out[z].label !== a.label)) allOk = false; res.verified = allOk; }
+    return res;
+  };
+
+  // ---- 2.2 project and media
+  H.media_items = function (a) {
+    var out = [];
+    var list = a.items ? asArray(a.items) : null;
+    if (list) for (var i = 0; i < list.length; i++) { var it = resolveItem(list[i]); out.push(mediaRecord(it)); }
+    else { var all = mediaItems(); for (var j = 0; j < all.length; j++) { var off = false; try { off = !!all[j].it.isOffline(); } catch (e) {} if (!a.offline_only || off) out.push(mediaRecord(all[j].it)); } }
+    return { items: out };
+  };
+  function mediaRecord(it) {
+    var d = describeItem(it, undefined, true);
+    try { d.offline = !!it.isOffline(); } catch (e) {}
+    try { d.canChangePath = !!it.canChangeMediaPath(); } catch (e2) {}
+    return d;
+  }
+  H.media_action = function (a) {
+    var act = a.action, items = asArray(a.items), out = [];
+    if (act === "proxies_enable") { app.setEnableProxies(a.enabled ? 1 : 0); return { proxiesEnabled: !!app.getEnableProxies(), verified: !!app.getEnableProxies() === !!a.enabled }; }
+    if (!items.length) fail("BAD_ARGS", "Pass items.");
+    for (var i = 0; i < items.length; i++) {
+      var it = resolveItem(items[i]), d = { id: String(it.nodeId), name: it.name };
+      if (act === "set_offline") { it.setOffline(); d.offline = !!it.isOffline(); d.verified = d.offline; }
+      else if (act === "relink") {
+        var f = new File(a.paths ? a.paths[i] : a.path);
+        if (!f.exists) fail("FILE_NOT_FOUND", "File not found: " + f.fsName);
+        if (!it.canChangeMediaPath()) fail("CANNOT_RELINK", it.name + " cannot change its media path.");
+        it.changeMediaPath(f.fsName, true);
+        d.media = itemMediaPath(it);
+        d.verified = lower(d.media) === lower(f.fsName);
+      }
+      else if (act === "attach_proxy") {
+        var pf = new File(a.paths ? a.paths[i] : a.path);
+        if (!pf.exists) fail("FILE_NOT_FOUND", "Proxy not found: " + pf.fsName);
+        it.attachProxy(pf.fsName, a.hi_res ? 1 : 0);
+        d.hasProxy = !!it.hasProxy(); d.proxy = it.getProxyPath(); d.verified = d.hasProxy;
+      }
+      else if (act === "detach_proxy") { it.detachProxy(); d.hasProxy = !!it.hasProxy(); d.verified = !d.hasProxy; }
+      else if (act === "proxy_status") { d.hasProxy = !!it.hasProxy(); try { d.proxy = it.getProxyPath(); } catch (e) {} try { d.canProxy = !!it.canProxy(); } catch (e2) {} }
+      else if (act === "interpret") {
+        var fi = it.getFootageInterpretation();
+        if (has(a, "fps")) fi.frameRate = a.fps;
+        if (has(a, "par")) fi.pixelAspectRatio = a.par;
+        if (has(a, "field")) fi.fieldType = { "default": -1, progressive: 0, upper: 1, lower: 2 }[a.field];
+        if (has(a, "alpha")) fi.alphaUsage = { none: 0, straight: 1, premultiplied: 2, ignore: 3 }[a.alpha];
+        if (has(a, "invert_alpha")) fi.invertAlpha = !!a.invert_alpha;
+        it.setFootageInterpretation(fi);
+        var g = it.getFootageInterpretation();
+        d.interpretation = { fps: r3(g.frameRate), par: r3(g.pixelAspectRatio), field: g.fieldType, alpha: g.alphaUsage, invertAlpha: !!g.invertAlpha };
+        d.verified = (!has(a, "fps") || Math.abs(g.frameRate - a.fps) < 0.01) && (!has(a, "par") || Math.abs(g.pixelAspectRatio - a.par) < 0.001);
+      }
+      else if (act === "scale_to_frame") { it.setScaleToFrameSize(); d.done = true; }
+      else if (act === "color_space") {
+        if (a.color_space) {
+          var lst = it.getOverrideColorSpaceList ? it.getOverrideColorSpaceList : null, chosen = null, names = [];
+          if (lst) for (var k = 0; k < lst.length; k++) { names.push(lst[k].name); if (lower(lst[k].name) === lower(a.color_space)) chosen = lst[k]; }
+          if (!chosen) fail("BAD_ARGS", "Unknown color space '" + a.color_space + "'.", "Use one of: " + names.join(", "));
+          it.setOverrideColorSpace(chosen);
+        }
+        var cs = it.getColorSpace(), oc = null;
+        try { oc = it.getOriginalColorSpace().name; } catch (e3) {}
+        d.colorSpace = cs.name; d.original = oc;
+        if (a.color_space) d.verified = lower(cs.name) === lower(a.color_space);
+      }
+      else if (act === "input_lut") {
+        var lf = new File(a.path);
+        if (!lf.exists) fail("FILE_NOT_FOUND", "LUT not found: " + lf.fsName);
+        var fi2 = it.getFootageInterpretation();
+        fi2.setInputLUTFromFilePath(lf.fsName);
+        it.setFootageInterpretation(fi2);
+        try { d.inputLUT = it.getInputLUTID(); } catch (e4) {}
+        d.verified = !!d.inputLUT;
+      }
+      else fail("BAD_ARGS", "Unknown media action " + act);
+      out.push(d);
+    }
+    var allV = true, anyV = false;
+    for (var z = 0; z < out.length; z++) if (out[z].verified !== undefined) { anyV = true; if (!out[z].verified) allV = false; }
+    var res = { items: out };
+    if (anyV) res.verified = allV;
+    return res;
+  };
+  H.project_tools = function (a) {
+    var p = requireProject(), act = a.action;
+    if (act === "consolidate_duplicates") { var before = mediaItems().length; p.consolidateDuplicates(); return { before: before, after: mediaItems().length }; }
+    if (act === "scratch_disks") {
+      var types = { capture_video: ScratchDiskType.FirstVideoCaptureFolder, capture_audio: ScratchDiskType.FirstAudioCaptureFolder, previews_video: ScratchDiskType.FirstVideoPreviewFolder, previews_audio: ScratchDiskType.FirstAudioPreviewFolder, autosave: ScratchDiskType.FirstAutoSaveFolder, cc_libraries: ScratchDiskType.FirstCClibrariesFolder, capsule_media: ScratchDiskType.FirstCapsuleMediaFolder };
+      var keys = a.types ? asArray(a.types) : ["previews_video", "previews_audio"], done = [];
+      var folder = new Folder(a.path);
+      if (!folder.exists) folder.create();
+      for (var i = 0; i < keys.length; i++) { if (types[keys[i]] === undefined) fail("BAD_ARGS", "Unknown scratch disk type " + keys[i]); app.setScratchDiskPath(folder.fsName, types[keys[i]]); done.push(keys[i]); }
+      return { path: folder.fsName, set: done };
+    }
+    if (act === "smart_bin") {
+      var parent = a.bin ? binByPath(a.bin, true) : p.rootItem;
+      parent.createSmartBin(a.name, a.query);
+      var found = null;
+      for (var k = 0; k < parent.children.numItems; k++) if (parent.children[k].name === a.name) found = parent.children[k];
+      return { name: a.name, query: a.query, created: !!found, verified: !!found };
+    }
+    if (act === "consolidate_and_transfer") {
+      var pm = app.projectManager, o = pm.options;
+      var dest = new Folder(a.path);
+      if (!dest.exists) dest.create();
+      o.clipTransferOption = o.CLIP_TRANSFER_COPY;
+      o.destinationPath = dest.fsName;
+      o.excludeUnused = a.exclude_unused !== false;
+      o.handleFrameCount = a.handle_frames || 0;
+      o.includePreviews = false;
+      o.includeConformedAudio = false;
+      o.renameMedia = false;
+      o.includeAllSequences = true;
+      var r = pm.process(p);
+      var errs = [];
+      try { var e = pm.errors; if (e) for (var q = 0; q < e.length; q++) errs.push(String(e[q])); } catch (eE) {}
+      return { destination: dest.fsName, result: r, errors: errs };
+    }
+    if (act === "create_bins") { var made = []; var bl = asArray(a.bins); for (var b = 0; b < bl.length; b++) { binByPath(bl[b], true); made.push(bl[b]); } return { bins: made }; }
+    if (act === "structure") {
+      var bins = [], counts = {};
+      walk(p.rootItem, "", function (it, path) {
+        if (it.type === 2) { bins.push((path ? path + "/" : "") + it.name); return; }
+        var t = itemType(it), mp = lower(itemMediaPath(it)), ext = mp.replace(/^.*\./, "");
+        var kind = t === "sequence" ? "sequence" : (/^(mp4|mov|mxf|avi|mkv|m4v|mts|r3d|braw|webm)$/.test(ext) ? "video" : (/^(wav|mp3|aif|aiff|m4a|aac|flac|ogg)$/.test(ext) ? "audio" : (/^(png|jpe?g|tiff?|psd|gif|bmp|webp|exr|tga|ai|svg)$/.test(ext) ? "image" : (/^(mogrt|aegraphic)$/.test(ext) || it.isMGT ? "graphic" : "other"))));
+        counts[kind] = (counts[kind] || 0) + 1;
+        if (a.with_items) bins.push({ id: String(it.nodeId), name: it.name, bin: path || "/", kind: kind });
+      });
+      return { bins: bins, counts: counts };
+    }
+    fail("BAD_ARGS", "Unknown project_tools action " + act);
+  };
+  H.import_special = function (a) {
+    var p = requireProject(), f = new File(a.path), kind = a.kind;
+    if (!f.exists) fail("FILE_NOT_FOUND", "File not found: " + f.fsName);
+    var bin = a.bin ? binByPath(a.bin, true) : p.rootItem;
+    var beforeSeq = {}, seqs0 = allSequences();
+    for (var i = 0; i < seqs0.length; i++) beforeSeq[String(seqs0[i].sequenceID)] = 1;
+    var beforeCount = 0;
+    walk(p.rootItem, "", function () { beforeCount++; });
+    var ok = null;
+    if (kind === "ae_comps") {
+      if (a.comps && a.comps.length) ok = p.importAEComps(f.fsName, a.comps, bin);
+      else ok = p.importAllAEComps(f.fsName, bin);
+    } else if (kind === "sequences") {
+      if (!a.sequence_ids || !a.sequence_ids.length) fail("BAD_ARGS", "Pass sequence_ids (from list_project_sequences of that .prproj).");
+      ok = p.importSequences(f.fsName, a.sequence_ids);
+    } else {
+      ok = p.importFiles([f.fsName], true, bin, false);
+    }
+    var seqs = allSequences(), newSeq = [];
+    for (var j = 0; j < seqs.length; j++) if (!beforeSeq[String(seqs[j].sequenceID)]) newSeq.push({ id: String(seqs[j].sequenceID), name: seqs[j].name });
+    var afterCount = 0;
+    walk(p.rootItem, "", function () { afterCount++; });
+    return { kind: kind, path: f.fsName, result: ok, newItems: afterCount - beforeCount, newSequences: newSeq, verified: afterCount > beforeCount };
+  };
+
+
+  // ---- 2.3 sequences
+  H.sequence_from_clips = function (a) {
+    var p = requireProject(), items = asArray(a.items), list = [];
+    for (var i = 0; i < items.length; i++) list.push(resolveItem(items[i]));
+    if (!list.length) fail("BAD_ARGS", "Pass items.");
+    var before = {}, s0 = allSequences();
+    for (var k = 0; k < s0.length; k++) before[String(s0[k].sequenceID)] = 1;
+    var bin = a.bin ? binByPath(a.bin, true) : p.rootItem;
+    p.createNewSequenceFromClips(a.name || list[0].name, list, bin);
+    var seqs = allSequences(), made = null;
+    for (var j = 0; j < seqs.length; j++) if (!before[String(seqs[j].sequenceID)]) made = seqs[j];
+    if (!made) fail("SEQUENCE_CREATE_FAILED", "Premiere did not create the sequence.");
+    var res = summarizeSequence(made), n = 0;
+    eachClip(made, function () { n++; });
+    res.clips = n;
+    res.verified = n >= list.length;
+    return res;
+  };
+  H.sequence_extra = function (a) {
+    var s = getSequence(a.sequence), act = a.action, res = {};
+    if (act === "zero_point") {
+      s.setZeroPoint(String(secToTicks(a.seconds)));
+      res.zeroPoint = r3(ticksToSec(parseFloat(s.zeroPoint)));
+      res.verified = Math.abs(res.zeroPoint - a.seconds) < 0.001;
+    } else if (act === "custom_property") {
+      s.attachCustomProperty(a.name, String(a.value));
+      res.attached = { name: a.name, value: String(a.value) };
+    } else if (act === "format") {
+      var st = s.getSettings();
+      if (has(a, "display_format")) st.videoDisplayFormat = a.display_format;
+      if (has(a, "field_type")) st.videoFieldType = a.field_type;
+      if (has(a, "par")) st.videoPixelAspectRatio = String(a.par);
+      if (has(a, "audio_channel_type")) st.audioChannelType = a.audio_channel_type;
+      if (has(a, "audio_display_format")) st.audioDisplayFormat = a.audio_display_format;
+      if (has(a, "max_bit_depth")) st.maximumBitDepth = !!a.max_bit_depth;
+      if (has(a, "max_render_quality")) st.maximumRenderQuality = !!a.max_render_quality;
+      s.setSettings(st);
+      var g = s.getSettings();
+      res = { displayFormat: g.videoDisplayFormat, fieldType: g.videoFieldType, par: g.videoPixelAspectRatio, audioChannelType: g.audioChannelType, maxBitDepth: g.maximumBitDepth, maxRenderQuality: g.maximumRenderQuality };
+      res.verified = (!has(a, "display_format") || g.videoDisplayFormat === a.display_format) && (!has(a, "field_type") || g.videoFieldType === a.field_type);
+    } else if (act === "render_previews") {
+      var qs = qeSequenceFor(s);
+      if (a.audio) qs.renderAudio(); else qs.renderAll();
+      res.rendered = true;
+    } else if (act === "delete_previews") {
+      var qs2 = qeSequenceFor(s);
+      qs2.deletePreviewFiles(timecodeFor(s, 0), timecodeFor(s, parseFloat(s.end)));
+      res.deleted = true;
+    } else fail("BAD_ARGS", "Unknown action " + act);
+    return res;
+  };
+  // Nest: the selected clips' time range on their tracks becomes a nested sequence placed in their place.
+  H.nest_clips = function (a) {
+    var s = getSequence(a.sequence), list = requireUnlocked(withLinked(s, requireClips(s, a.clips), a.include_linked)), lo = Infinity, hi = -Infinity, vt = 99, tracks = {};
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i].clip; lo = Math.min(lo, parseFloat(c.start.ticks)); hi = Math.max(hi, parseFloat(c.end.ticks));
+      tracks[list[i].track] = 1;
+      if (list[i].video) vt = Math.min(vt, parseTrackRef(list[i].track).index);
+    }
+    // Only the clips' tracks are copied into the nest.
+    var saved = [];
+    var groups = [[s.videoTracks, true], [s.audioTracks, false]];
+    for (var g = 0; g < groups.length; g++) for (var t = 0; t < groups[g][0].numTracks; t++) {
+      var tr = groups[g][0][t], lab = trackLabel(groups[g][1], t), was = false;
+      try { was = tr.isTargeted(); } catch (e) {}
+      saved.push({ tr: tr, was: was });
+      try { tr.setTargeted(!!tracks[lab], true); } catch (e2) {}
+    }
+    var savedIn = null, savedOut = null;
+    try { savedIn = tsec(s.getInPointAsTime()); savedOut = tsec(s.getOutPointAsTime()); } catch (eS) {}
+    s.setInPoint(ticksToSec(lo)); s.setOutPoint(ticksToSec(hi));
+    var before = {}, s0 = allSequences();
+    for (var k = 0; k < s0.length; k++) before[String(s0[k].sequenceID)] = 1;
+    s.createSubsequence(false);
+    var seqs = allSequences(), sub = null;
+    for (var j = 0; j < seqs.length; j++) if (!before[String(seqs[j].sequenceID)]) sub = seqs[j];
+    for (var r = 0; r < saved.length; r++) try { saved[r].tr.setTargeted(saved[r].was, true); } catch (e3) {}
+    try { if (savedIn !== null && savedIn > -399999) s.setInPoint(savedIn); if (savedOut !== null && savedOut > -399999) s.setOutPoint(savedOut); } catch (eR) {}
+    activate(s);
+    if (!sub) fail("NEST_FAILED", "Premiere did not create the nested sequence.");
+    if (a.name) sub.name = a.name;
+    // Remove the originals, then put the nest where they were.
+    for (var m = list.length - 1; m >= 0; m--) { var f = findClip(s, list[m].clip.nodeId); if (f) f.clip.remove(false, true); }
+    var vIdx = vt === 99 ? 0 : vt;
+    var tgt = s.videoTracks[vIdx];
+    tgt.overwriteClip(sub.projectItem, ticksToSec(lo));
+    var placed = findPlacedClip(tgt, lo, null, 2);
+    return { nested: { id: String(sub.sequenceID), name: sub.name }, start: r3(ticksToSec(lo)), end: r3(ticksToSec(hi)), clip: placed ? String(placed.nodeId) : null, removed: list.length, verified: !!placed };
+  };
+  // Unnest: put the clips of a nested sequence back on the parent timeline at the nest's offset.
+  H.unnest_clip = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), done = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i], c = e.clip, pi = c.projectItem, inner = null;
+      if (!pi || !pi.isSequence()) fail("NOT_A_NEST", "Clip '" + c.name + "' is not a nested sequence.");
+      var seqs = allSequences();
+      for (var k = 0; k < seqs.length; k++) if (String(seqs[k].projectItem.nodeId) === String(pi.nodeId)) inner = seqs[k];
+      if (!inner) fail("NOT_A_NEST", "The nested sequence of '" + c.name + "' was not found.");
+      var off = tsec(c.start) - tsec(c.inPoint), from = tsec(c.inPoint), to = tsec(c.outPoint), specs = [];
+      var baseV = parseTrackRef(e.track).index, minV = 99;
+      // Inner video tracks map so the lowest one used lands on the nest's track.
+      eachClip(inner, function (ic, label, idx, tr, video) { if (video) minV = Math.min(minV, parseTrackRef(label).index); });
+      if (minV === 99) minV = 0;
+      eachClip(inner, function (ic, label, idx, tr, video) {
+        var cs = tsec(ic.start), ce = tsec(ic.end);
+        if (ce <= from + 0.0005 || cs >= to - 0.0005) return;
+        var cut0 = Math.max(0, from - cs), cut1 = Math.max(0, ce - to), sp = clipSpeed(ic);
+        var ref = parseTrackRef(label);
+        var spec = { item: String(ic.projectItem.nodeId), track: trackLabel(video, video ? ref.index - minV + baseV : ref.index), start: r3(cs + cut0 + off), "in": r3((tsec(ic.inPoint) + cut0) * sp), out: r3((tsec(ic.outPoint) - cut1) * sp), media: video ? "video" : "audio" };
+        specs.push(spec);
+      });
+      var linked = linkedEntries(s, c);
+      for (var l = 0; l < linked.length; l++) linked[l].clip.remove(false, true);
+      c.remove(false, true);
+      var r = H.place_clips({ sequence: a.sequence, clips: specs, auto_create_tracks: true });
+      done.push({ nest: inner.name, placed: r.placed.length, errors: r.errors });
+    }
+    var ok = true;
+    for (var q = 0; q < done.length; q++) if (done[q].errors && done[q].errors.length) ok = false;
+    return { unnested: done, verified: ok, note: "Effects applied to the nest clip or to the inner clips are not carried over; use copy_effects." };
+  };
+
+  // ---- 2.4 timeline editing
+  function framesTc(s, seconds) {
+    var fr = fps(s), nominal = Math.round(fr), neg = seconds < 0, frames = Math.round(Math.abs(seconds) * fr);
+    var tc = pad2(Math.floor(frames / (nominal * 3600))) + ";" + pad2(Math.floor(frames / (nominal * 60)) % 60) + ";" + pad2(Math.floor(frames / nominal) % 60) + ";" + pad2(frames % nominal);
+    return (neg ? "-" : "") + tc;
+  }
+  function clipSnap(c) { return { id: String(c.nodeId), start: r3(tsec(c.start)), end: r3(tsec(c.end)), "in": r3(tsec(c.inPoint) * clipSpeed(c)), out: r3(tsec(c.outPoint) * clipSpeed(c)) }; }
+  // QE slip / slide / roll on each clip (and its linked clips for slip/slide).
+  H.edit_qe = function (a) {
+    var s = getSequence(a.sequence), act = a.action, list = requireClips(s, a.clips), out = [];
+    if (!isNum(a.delta) || a.delta === 0) fail("BAD_ARGS", "delta (seconds, non zero) is required.");
+    var all = act === "roll" ? list : withLinked(s, list, a.include_linked);
+    requireUnlocked(all);
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i], before = clipSnap(e.clip), startTicks = parseFloat(e.clip.start.ticks), qc = qeClipFor(s, e), ok;
+      if (act === "slip") ok = qc.slip(framesTc(s, -a.delta), false);
+      else if (act === "slide") ok = qc.slide(framesTc(s, a.delta), false);
+      else if (act === "roll") ok = qc.roll(framesTc(s, a.delta), false, false);
+      var now = findPlacedClip(e.trackObj, act === "slide" ? startTicks + secToTicks(a.delta) : startTicks, null, frameTicks(s) * 0.6) || findClip(s, before.id);
+      var after = now ? clipSnap(now.clip || now) : null;
+      var d = { id: before.id, track: e.track, before: before, after: after };
+      if (after) {
+        if (act === "slip") d.verified = Math.abs(after["in"] - before["in"] - a.delta) < 0.05 && Math.abs(after.start - before.start) < 0.01;
+        if (act === "slide") d.verified = Math.abs(after.start - before.start - a.delta) < 0.05 && Math.abs(after["in"] - before["in"]) < 0.01;
+        if (act === "roll") d.verified = Math.abs(after.end - before.end - a.delta) < 0.05;
+      } else d.verified = false;
+      out.push(d);
+    }
+    var v = true;
+    for (var k = 0; k < out.length; k++) if (!out[k].verified) v = false;
+    return { action: act, clips: out, verified: v };
+  };
+  // Remove time ranges with ripple, on all tracks or the given ones, in one call.
+  H.ripple_delete_ranges = function (a) {
+    var s = getSequence(a.sequence), ranges = asArray(a.ranges), qs = qeSequenceFor(s);
+    if (!ranges.length) fail("BAD_ARGS", "Pass ranges [{start, end}].");
+    var targets = [];
+    if (a.tracks) { var tl = asArray(a.tracks); for (var t = 0; t < tl.length; t++) { var ref = parseTrackRef(tl[t]); targets.push({ video: ref.video, index: ref.index, obj: getTrack(s, tl[t], false).track }); } }
+    else {
+      for (var v = 0; v < s.videoTracks.numTracks; v++) targets.push({ video: true, index: v, obj: s.videoTracks[v] });
+      for (var au = 0; au < s.audioTracks.numTracks; au++) targets.push({ video: false, index: au, obj: s.audioTracks[au] });
+    }
+    for (var lk = 0; lk < targets.length; lk++) { var locked = false; try { locked = targets[lk].obj.isLocked(); } catch (eL) {} if (locked && targets[lk].obj.clips.numItems) fail("TRACK_LOCKED", trackLabel(targets[lk].video, targets[lk].index) + " is locked."); }
+    // Normalize: snap to frames, merge overlaps, process from the last range back.
+    var rs = [];
+    for (var i = 0; i < ranges.length; i++) {
+      var st = snapTicks(s, secToTicks(ranges[i].start)), en = snapTicks(s, secToTicks(ranges[i].end));
+      if (!(en > st)) fail("BAD_ARGS", "Range " + i + " has end <= start.");
+      rs.push([st, en]);
+    }
+    rs.sort(function (x, y) { return x[0] - y[0]; });
+    var merged = [];
+    for (var m = 0; m < rs.length; m++) { if (merged.length && rs[m][0] <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], rs[m][1]); else merged.push(rs[m]); }
+    var seqEnd0 = parseFloat(s.end), removedTotal = 0, removedClips = 0;
+    for (var r = merged.length - 1; r >= 0; r--) {
+      var a0 = merged[r][0], a1 = merged[r][1], len = a1 - a0;
+      for (var k = 0; k < targets.length; k++) {
+        var tr = targets[k].obj, qt = targets[k].video ? qs.getVideoTrackAt(targets[k].index) : qs.getAudioTrackAt(targets[k].index);
+        // cut at both edges where a clip spans them
+        var edges = [a1, a0];
+        for (var ed = 0; ed < edges.length; ed++) {
+          var cl = tr.clips, at = lowerBoundClip(cl, edges[ed]);
+          for (var x = Math.max(0, at - 1); x < cl.numItems && x <= at; x++) { var cs = parseFloat(cl[x].start.ticks), ce = parseFloat(cl[x].end.ticks); if (cs < edges[ed] - 1 && ce > edges[ed] + 1) { qt.razor(timecodeFor(s, edges[ed]), false, true); break; } }
+        }
+        // remove clips inside, then pull the rest left
+        var inside = [];
+        for (var y = 0; y < tr.clips.numItems; y++) { var c = tr.clips[y], s0 = parseFloat(c.start.ticks), e0 = parseFloat(c.end.ticks); if (s0 >= a0 - 2 && e0 <= a1 + 2) inside.push(c); }
+        for (var z = inside.length - 1; z >= 0; z--) { inside[z].remove(false, true); removedClips++; }
+        shiftFollowers(tr, a1 - 2, -len, "");
+      }
+      removedTotal += len;
+    }
+    var res = { ranges: merged.length, removedSeconds: r3(ticksToSec(removedTotal)), removedClips: removedClips, durationBefore: r3(seqEnd0 / TPS), durationAfter: r3(parseFloat(s.end) / TPS) };
+    res.verified = !a.tracks ? Math.abs((seqEnd0 - parseFloat(s.end)) - removedTotal) < frameTicks(s) * 1.5 || parseFloat(s.end) < seqEnd0 : true;
+    return res;
+  };
+  H.edit_misc = function (a) {
+    var s = getSequence(a.sequence), act = a.action, out = [];
+    if (act === "batch_rename") {
+      var list = requireClips(s, a.clips), pat = a.pattern || "{name} {n}";
+      list.sort(function (x, y) { return tsec(x.clip.start) - tsec(y.clip.start) || (x.track < y.track ? -1 : 1); });
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i].clip, n = (a.start_number || 1) + i;
+        var name = pat.replace(/\{n(?::0?(\d+))?\}/g, function (m0, w) { var t = String(n); if (w) while (t.length < parseInt(w, 10)) t = "0" + t; return t; }).replace(/\{name\}/g, c.name).replace(/\{track\}/g, list[i].track);
+        c.name = name;
+        out.push({ id: String(c.nodeId), name: c.name, ok: c.name === name });
+      }
+      var okAll = true; for (var q = 0; q < out.length; q++) if (!out[q].ok) okAll = false;
+      return { renamed: out, verified: okAll };
+    }
+    if (act === "ripple_trim") {
+      // Trim one edge and pull/push the rest of the track (and linked tracks) by the same amount.
+      var l2 = requireUnlocked(withLinked(s, requireClips(s, a.clips), a.include_linked)), res2 = [];
+      var edge = a.edge || "end", d = a.delta;
+      if (!isNum(d)) fail("BAD_ARGS", "delta (seconds) is required.");
+      for (var k = 0; k < l2.length; k++) {
+        var e = l2[k], cl = e.clip, oldEnd = parseFloat(cl.end.ticks), oldStart = parseFloat(cl.start.ticks), id = String(cl.nodeId);
+        var spec = edge === "start" ? { trim_start: d } : { trim_end: -d };
+        planTrim(s, cl, spec)();
+        var fresh = findClip(s, id).clip;
+        if (edge === "start") {
+          // keep the clip's start where it was: move it back, shift followers by -d
+          var sh = -snapTicks(s, secToTicks(d));
+          shiftFollowers(e.trackObj, oldEnd - 2, sh, id);
+          fresh.move(timeFromTicks(oldStart - parseFloat(fresh.start.ticks)));
+        } else shiftFollowers(e.trackObj, oldEnd - 2, parseFloat(fresh.end.ticks) - oldEnd, id);
+        res2.push(clipSnap(findClip(s, id).clip));
+      }
+      return { clips: res2 };
+    }
+    if (act === "duplicate") {
+      var l3 = requireClips(s, a.clips), placed = [];
+      for (var j = 0; j < l3.length; j++) {
+        var src = l3[j], sc = src.clip, sp = clipSpeed(sc), dur = tsec(sc.end) - tsec(sc.start);
+        var to = has(a, "to") ? a.to + (tsec(sc.start) - tsec(l3[0].clip.start)) : tsec(sc.end) + (a.gap || 0);
+        var spec2 = { item: String(sc.projectItem.nodeId), track: a.track || src.track, start: to, "in": r3(tsec(sc.inPoint) * sp), out: r3(tsec(sc.outPoint) * sp), media: src.video ? (a.include_linked === false ? "video" : "both") : "audio" };
+        var pr = H.place_clips({ sequence: a.sequence, clips: [spec2] });
+        if (pr.placed.length) {
+          var nid = pr.placed[0].id;
+          try { H.copy_effects({ sequence: a.sequence, from: String(sc.nodeId), to: [nid] }); } catch (eC) {}
+          placed.push({ from: String(sc.nodeId), id: nid, start: pr.placed[0].start, end: pr.placed[0].end, duration: r3(dur) });
+        } else placed.push({ from: String(sc.nodeId), error: pr.errors });
+      }
+      var okD = true; for (var w = 0; w < placed.length; w++) if (!placed[w].id) okD = false;
+      return { duplicated: placed, verified: okD };
+    }
+    if (act === "lift_range" || act === "extract_range") {
+      if (act === "extract_range") return H.ripple_delete_ranges({ sequence: a.sequence, ranges: [{ start: a.start, end: a.end }], tracks: a.tracks });
+      // lift: cut at the edges, remove what is inside, no ripple
+      var qs = qeSequenceFor(s), a0 = snapTicks(s, secToTicks(a.start)), a1 = snapTicks(s, secToTicks(a.end)), removed = 0;
+      var tracks = [];
+      if (a.tracks) { var tl = asArray(a.tracks); for (var t = 0; t < tl.length; t++) { var ref = parseTrackRef(tl[t]); tracks.push({ video: ref.video, index: ref.index, obj: getTrack(s, tl[t], false).track }); } }
+      else { for (var v = 0; v < s.videoTracks.numTracks; v++) tracks.push({ video: true, index: v, obj: s.videoTracks[v] }); for (var au = 0; au < s.audioTracks.numTracks; au++) tracks.push({ video: false, index: au, obj: s.audioTracks[au] }); }
+      for (var tk = 0; tk < tracks.length; tk++) {
+        var tr = tracks[tk].obj, qt = tracks[tk].video ? qs.getVideoTrackAt(tracks[tk].index) : qs.getAudioTrackAt(tracks[tk].index);
+        var eds = [a1, a0];
+        for (var ed = 0; ed < eds.length; ed++) { for (var x = 0; x < tr.clips.numItems; x++) { var cs = parseFloat(tr.clips[x].start.ticks), ce = parseFloat(tr.clips[x].end.ticks); if (cs < eds[ed] - 1 && ce > eds[ed] + 1) { qt.razor(timecodeFor(s, eds[ed]), false, true); break; } } }
+        var ins = [];
+        for (var y = 0; y < tr.clips.numItems; y++) { var cc = tr.clips[y]; if (parseFloat(cc.start.ticks) >= a0 - 2 && parseFloat(cc.end.ticks) <= a1 + 2) ins.push(cc); }
+        for (var z = ins.length - 1; z >= 0; z--) { ins[z].remove(false, true); removed++; }
+      }
+      return { lifted: removed, start: r3(ticksToSec(a0)), end: r3(ticksToSec(a1)) };
+    }
+    if (act === "split_edit") {
+      // J/L cut: move only the audio edge of linked pairs. audio_lead > 0 starts the audio earlier (J); audio_tail > 0 ends it later (L).
+      var l4 = requireClips(s, a.clips), res4 = [];
+      for (var p4 = 0; p4 < l4.length; p4++) {
+        var ve = l4[p4], auds = ve.video ? linkedEntries(s, ve.clip) : [ve];
+        for (var q4 = 0; q4 < auds.length; q4++) {
+          if (auds[q4].video) continue;
+          var ac = auds[q4].clip, aid = String(ac.nodeId), sp4 = {};
+          if (isNum(a.audio_lead) && a.audio_lead !== 0) sp4.trim_start = -a.audio_lead;
+          if (isNum(a.audio_tail) && a.audio_tail !== 0) sp4.trim_end = -a.audio_tail;
+          requireUnlocked([auds[q4]]);
+          planTrim(s, ac, sp4)();
+          res4.push({ audio: aid, video: String(ve.clip.nodeId), after: clipSnap(findClip(s, aid).clip) });
+        }
+      }
+      if (!res4.length) fail("NO_AUDIO", "The selected clips have no linked audio to split.");
+      return { split: res4 };
+    }
+    if (act === "freeze_frame") {
+      // The frame at `at` held for `duration` s: cut at `at`, push the rest right, put a still there.
+      var e5 = requireClips(s, a.clips)[0], cl5 = e5.clip, at = has(a, "at") ? a.at : tsec(cl5.start);
+      if (!e5.video) fail("BAD_ARGS", "freeze_frame needs a video clip.");
+      if (!a.still_path) fail("BAD_ARGS", "still_path is required (the server renders it).");
+      var atT = snapTicks(s, secToTicks(at)), durT = snapTicks(s, secToTicks(a.duration || 2));
+      var qs5 = qeSequenceFor(s);
+      if (parseFloat(cl5.start.ticks) < atT - 1 && parseFloat(cl5.end.ticks) > atT + 1) qs5.getVideoTrackAt(parseTrackRef(e5.track).index).razor(timecodeFor(s, atT), true, true);
+      var shiftTracks = a.ripple === false ? [] : [e5.trackObj];
+      if (a.ripple !== false) { var lk5 = linkedEntries(s, cl5); for (var u = 0; u < lk5.length; u++) shiftTracks.push(lk5[u].trackObj); }
+      for (var st5 = 0; st5 < shiftTracks.length; st5++) shiftFollowers(shiftTracks[st5], atT - 2, durT, "");
+      var imp = H.import_files({ paths: [a.still_path], bin: "_MCP Plus/Freeze frames" });
+      var pr5 = H.place_clips({ sequence: a.sequence, clips: [{ item: imp.imported[0].id, track: e5.track, start: ticksToSec(atT), duration: ticksToSec(durT), media: "video" }] });
+      return { frozenAt: r3(ticksToSec(atT)), duration: r3(ticksToSec(durT)), still: pr5.placed[0] || null, errors: pr5.errors, verified: pr5.placed.length === 1 && Math.abs(pr5.placed[0].start - ticksToSec(atT)) < 0.02 };
+    }
+    fail("BAD_ARGS", "Unknown action " + act);
+  };
+  // Time interpolation / frame blending (QE) for speed-changed clips.
+  H.time_interpolation = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
+    var modes = { frame_sampling: 0, frame_blending: 1, optical_flow: 2 };
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i], qc = qeClipFor(s, e), d = { id: String(e.clip.nodeId) };
+      if (a.interpolation) { if (modes[a.interpolation] === undefined) fail("BAD_ARGS", "interpolation: frame_sampling, frame_blending or optical_flow"); qc.setTimeInterpolationType(modes[a.interpolation]); d.interpolation = qeClipFor(s, e).timeInterpolationType; d.verified = d.interpolation === modes[a.interpolation]; }
+      if (has(a, "frame_blend")) { qc.setFrameBlend(!!a.frame_blend); d.frameBlend = !!qeClipFor(s, e).frameBlend; }
+      out.push(d);
+    }
+    var v = true; for (var k = 0; k < out.length; k++) if (out[k].verified === false) v = false;
+    return { clips: out, verified: v };
+  };
+  // ---- source monitor
+  H.source = function (a) {
+    var act = a.action, sm = app.sourceMonitor;
+    if (act === "open") { var it = resolveItem(a.item); if (has(a, "in") || has(a, "out")) { if (has(a, "in")) it.setInPoint(a["in"], 4); if (has(a, "out")) it.setOutPoint(a.out, 4); } sm.openProjectItem(it); var cur = sm.getProjectItem(); return { open: cur ? cur.name : null, verified: !!cur && String(cur.nodeId) === String(it.nodeId) }; }
+    if (act === "close") { sm.closeAllClips(); return { closed: true }; }
+    if (act === "state") { var pi = sm.getProjectItem(); var pos = null; try { pos = r3(tsec(sm.getPosition())); } catch (e) {} return { item: pi ? { id: String(pi.nodeId), name: pi.name, "in": r3(tsec(pi.getInPoint())), out: r3(tsec(pi.getOutPoint())) } : null, position: pos }; }
+    if (act === "insert" || act === "overwrite") {
+      var s = getSequence(a.sequence), item = a.item ? resolveItem(a.item) : sm.getProjectItem();
+      if (!item) fail("BAD_ARGS", "No item: pass item or open one in the source monitor first.");
+      if (has(a, "in")) item.setInPoint(a["in"], 4);
+      if (has(a, "out")) item.setOutPoint(a.out, 4);
+      var at = has(a, "time") ? a.time : tsec(s.getPlayerPosition());
+      var vi = -1, ai = -1;
+      if (a.video_track) vi = getTrack(s, a.video_track, true).index; else for (var v = 0; v < s.videoTracks.numTracks && vi < 0; v++) try { if (s.videoTracks[v].isTargeted()) vi = v; } catch (e1) {}
+      if (a.audio_track) ai = getTrack(s, a.audio_track, true).index; else for (var u = 0; u < s.audioTracks.numTracks && ai < 0; u++) try { if (s.audioTracks[u].isTargeted()) ai = u; } catch (e2) {}
+      if (vi < 0 && ai < 0) fail("NO_TARGET_TRACKS", "No targeted tracks.", "Target tracks with manage_tracks (target: true) or pass video_track / audio_track.");
+      var tm = seqTime(s, at);
+      if (act === "insert") s.insertClip(item, tm, vi < 0 ? 0 : vi, ai < 0 ? 0 : ai); else s.overwriteClip(item, tm, vi < 0 ? 0 : vi, ai < 0 ? 0 : ai);
+      var placed = vi >= 0 ? findPlacedClip(s.videoTracks[vi], parseFloat(tm.ticks), null, 2) : findPlacedClip(s.audioTracks[ai], parseFloat(tm.ticks), null, 2);
+      return { action: act, item: item.name, time: r3(tsec(tm)), clip: placed ? clipSnap(placed) : null, verified: !!placed };
+    }
+    if (act === "match_frame") {
+      var s2 = getSequence(a.sequence), t = tsec(s2.getPlayerPosition()), hit = null;
+      for (var vv = s2.videoTracks.numTracks - 1; vv >= 0 && !hit; vv--) { var tr = s2.videoTracks[vv]; for (var k = 0; k < tr.clips.numItems; k++) { var c = tr.clips[k]; if (tsec(c.start) <= t + 0.0005 && tsec(c.end) > t + 0.0005) { hit = { clip: c, track: "V" + (vv + 1) }; break; } } }
+      if (!hit) fail("NO_CLIPS_MATCHED", "No video clip under the playhead.");
+      var src = hit.clip.projectItem, mediaT = (tsec(hit.clip.inPoint) + (t - tsec(hit.clip.start))) * clipSpeed(hit.clip);
+      sm.openProjectItem(src);
+      return { item: src.name, itemId: String(src.nodeId), track: hit.track, sequenceTime: r3(t), mediaTime: r3(mediaT) };
+    }
+    fail("BAD_ARGS", "Unknown source action " + act);
+  };
+
+
+  // ---- 2.5 color, effects, keyframes
+  // Lumetri Color parameter indices (Premiere 26.x; names repeat across sections, so by index).
+  var LUMETRI = {
+    temperature: 14, tint: 15, saturation: 16, exposure: 19, contrast: 20, highlights: 21, shadows: 22, whites: 23, blacks: 24,
+    look_intensity: 38, faded_film: 40, sharpen: 41, vibrance: 42, creative_saturation: 43,
+    vignette_amount: 110, vignette_midpoint: 111, vignette_roundness: 112, vignette_feather: 113
+  };
+  var LUMETRI_NAMES = { 14: "Temperature", 15: "Tint", 16: "Saturation", 19: "Exposure", 20: "Contrast", 21: "Highlights", 22: "Shadows", 23: "Whites", 24: "Blacks", 38: "Intensity", 40: "Faded Film", 41: "Sharpen", 42: "Vibrance", 43: "Saturation", 110: "Amount", 111: "Midpoint", 112: "Roundness", 113: "Feather" };
+  function lumetriOn(s, entry, add) {
+    var c = findComponent(entry.clip, "AE.ADBE Lumetri");
+    if (!c && add) c = addEffect(s, entry, "video", resolveCatalogName("video", "Lumetri Color"), "AE.ADBE Lumetri");
+    if (!c) fail("EFFECT_NOT_FOUND", "No Lumetri Color on '" + entry.clip.name + "'.");
+    return c;
+  }
+  H.color_basic = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [], vals = a.values || {}, allOk = true;
+    for (var k in vals) if (vals.hasOwnProperty(k) && LUMETRI[k] === undefined) fail("BAD_ARGS", "Unknown Lumetri control '" + k + "'.", "Use: " + (function () { var n = []; for (var x in LUMETRI) if (LUMETRI.hasOwnProperty(x)) n.push(x); return n.join(", "); })());
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (!e.video) continue;
+      var comp = lumetriOn(s, e, true), set = {};
+      for (var key in vals) {
+        if (!vals.hasOwnProperty(key)) continue;
+        var idx = LUMETRI[key], p = comp.properties[idx];
+        if (!p) fail("PROPERTY_NOT_FOUND", "Lumetri control " + key + " (index " + idx + ") is missing on this Premiere version.");
+        if (p.isTimeVarying()) p.setTimeVarying(false);
+        p.setValue(vals[key], UPDATE_UI);
+        var got = readValue(p);
+        set[key] = got;
+        if (typeof got === "number" && Math.abs(got - vals[key]) > 0.01) allOk = false;
+      }
+      out.push({ id: String(e.clip.nodeId), lumetri: comp.displayName, set: set });
+    }
+    if (!out.length) fail("NO_CLIPS_MATCHED", "No video clips in the selection.");
+    return { clips: out, verified: allOk };
+  };
+  H.color_read = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
+    for (var i = 0; i < list.length; i++) {
+      if (!list[i].video) continue;
+      var c = findComponent(list[i].clip, "AE.ADBE Lumetri"), d = { id: String(list[i].clip.nodeId), lumetri: !!c };
+      if (c) { d.values = {}; for (var k in LUMETRI) if (LUMETRI.hasOwnProperty(k) && c.properties[LUMETRI[k]]) d.values[k] = readValue(c.properties[LUMETRI[k]]); }
+      out.push(d);
+    }
+    return { clips: out };
+  };
+  H.stabilize = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), res = [];
+    var vids = [];
+    for (var i = 0; i < list.length; i++) if (list[i].video) vids.push(list[i]);
+    if (!vids.length) fail("NO_CLIPS_MATCHED", "No video clips selected.");
+    var r = applyEffectsTo(s, vids, [{ name: "Warp Stabilizer" }]);
+    for (var k = 0; k < r.length; k++) res.push({ id: r[k].id, added: r[k].added });
+    var done = false;
+    try { done = !!s.isDoneAnalyzingForVideoEffects(); } catch (e) {}
+    return { clips: res, analysisDone: done };
+  };
+  H.analysis_status = function (a) {
+    var s = getSequence(a.sequence), done = false;
+    try { done = !!s.isDoneAnalyzingForVideoEffects(); } catch (e) { fail("UNSUPPORTED_IN_PREMIERE", "This Premiere cannot report effect analysis status."); }
+    var busy = 0;
+    try { ensureQE(); busy = qe.project.numActiveProgressItems; } catch (e2) {}
+    return { done: done, progressItems: busy };
+  };
+  // Adjustment layers cannot be created by script: reuse one from the project.
+  H.adjustment_layer = function (a) {
+    var s = getSequence(a.sequence), found = null;
+    walk(requireProject().rootItem, "", function (it) { try { if (it.type !== 2 && it.isAdjustmentLayer && it.isAdjustmentLayer()) { found = it; return false; } } catch (e) {} });
+    if (a.item) found = resolveItem(a.item);
+    if (!found) fail("UNSUPPORTED_IN_PREMIERE", "Premiere's scripting API cannot create an Adjustment Layer.", "Create one once (Project panel > New Item > Adjustment Layer); this tool then finds and reuses it. Alternatively put the effects on the clips with apply_effects.");
+    var spec = { item: String(found.nodeId), track: a.track || "V2", start: a.start || 0, duration: a.duration || 5, media: "video" };
+    if (a.effects) spec.effects = a.effects;
+    var r = H.place_clips({ sequence: a.sequence, clips: [spec], auto_create_tracks: true });
+    if (a.preset_effects && r.placed.length) H.apply_effect_spec({ sequence: a.sequence, clips: [r.placed[0].id], effects: a.preset_effects });
+    return { item: found.name, placed: r.placed, errors: r.errors, verified: r.placed.length === 1 };
+  };
+  H.keyframe_tools = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [], act = a.action;
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i], c = e.clip, comp = requireComponent(c, a.effect || "Motion"), p = requireProp(comp, a.property), base = keyBase(c);
+      var d = { id: String(c.nodeId), property: p.displayName };
+      var keys = [];
+      try { if (p.isTimeVarying()) { var kl = p.getKeys(); for (var k = 0; kl && k < kl.length; k++) keys.push(kl[k]); } } catch (e0) {}
+      var inRange = function (t) { var cs = keyClipSeconds(base, t); return (!has(a, "from") || cs >= a.from - 0.0005) && (!has(a, "to") || cs <= a.to + 0.0005); };
+      if (act === "list") {
+        d.keys = [];
+        for (var q = 0; q < keys.length; q++) { var v = null; try { v = p.getValueAtKey(keys[q]); } catch (e1) {} d.keys.push({ t: keyClipSeconds(base, keys[q]), v: v }); }
+      } else if (act === "value_at") {
+        var t = keyTime(base, a.time || 0), val = null;
+        try { val = p.getValueAtTime(t); } catch (e2) { val = readValue(p); }
+        d.time = a.time || 0; d.value = val;
+      } else if (act === "interpolation") {
+        if (INTERP[a.interp] === undefined) fail("BAD_ARGS", "interp: linear, hold, bezier, ease");
+        var n = 0;
+        for (var r = 0; r < keys.length; r++) if (inRange(keys[r])) { p.setInterpolationTypeAtKey(keys[r], INTERP[a.interp], UPDATE_UI); n++; }
+        d.changed = n;
+      } else if (act === "move" || act === "scale") {
+        // Read values, remove the keys in range, add them back at the new times.
+        var moved = [];
+        for (var m = 0; m < keys.length; m++) if (inRange(keys[m])) moved.push({ t: keyClipSeconds(base, keys[m]), v: p.getValueAtKey(keys[m]) });
+        for (var z = 0; z < keys.length; z++) if (inRange(keys[z])) p.removeKey(keys[z]);
+        var pivot = has(a, "pivot") ? a.pivot : (has(a, "from") ? a.from : 0);
+        for (var w = 0; w < moved.length; w++) {
+          var nt = act === "move" ? moved[w].t + (a.delta || 0) : pivot + (moved[w].t - pivot) * (a.factor || 1);
+          nt = Math.max(0, Math.min(base.dur, nt));
+          var tt = keyTime(base, nt);
+          p.addKey(tt); p.setValueAtKey(tt, moved[w].v, UPDATE_UI);
+        }
+        d.changed = moved.length;
+        var after = [];
+        try { var kk = p.getKeys(); for (var y = 0; kk && y < kk.length; y++) after.push(keyClipSeconds(base, kk[y])); } catch (e3) {}
+        d.keysNow = after;
+      } else fail("BAD_ARGS", "Unknown action " + act);
+      out.push(d);
+    }
+    return { clips: out };
+  };
+  // Paste Attributes: pick what to copy from one clip to many.
+  H.paste_attributes = function (a) {
+    var s = getSequence(a.sequence), src = findClip(s, a.from);
+    if (!src) fail("CLIP_NOT_FOUND", "Source clip not found: " + a.from);
+    var what = a.attributes ? asArray(a.attributes) : ["motion", "opacity", "volume", "effects"], want = {};
+    for (var w = 0; w < what.length; w++) want[what[w]] = 1;
+    if (want.time_remapping) fail("UNSUPPORTED_IN_PREMIERE", "Time Remapping cannot be read or written by script on Premiere 26.x.", "Copy speed with set_clip_speed instead.");
+    var targets = requireClips(s, a.to), out = [], sBase = keyBase(src.clip);
+    for (var t = 0; t < targets.length; t++) {
+      var dst = targets[t], copied = [];
+      if (dst.video !== src.video || String(dst.clip.nodeId) === String(src.clip.nodeId)) continue;
+      var dBase = keyBase(dst.clip);
+      for (var k = 0; k < src.clip.components.numItems; k++) {
+        var sc = src.clip.components[k], mn = String(sc.matchName), dc = null;
+        var cat = mn === "AE.ADBE Motion" ? "motion" : (mn === "AE.ADBE Opacity" ? "opacity" : (/^Internal Volume/.test(mn) ? "volume" : (isBuiltIn(sc) ? "other" : "effects")));
+        if (!want[cat]) continue;
+        if (cat === "effects") {
+          if (a.effects && !inList(asArray(a.effects), String(sc.displayName))) continue;
+          dc = addEffect(s, dst, src.video ? "video" : "audio", resolveCatalogName(src.video ? "video" : "audio", sc.displayName), mn);
+        } else dc = findComponent(dst.clip, mn);
+        if (!dc) continue;
+        copyComponentValues(sc, dc, sBase, dBase, a.keyframe_mode || "relative");
+        copied.push(sc.displayName);
+      }
+      out.push({ id: String(dst.clip.nodeId), copied: copied });
+    }
+    return { clips: out, verified: out.length > 0 };
+  };
+
+  // ---- 2.6 audio
+  H.audio_tools = function (a) {
+    var s = getSequence(a.sequence), act = a.action, out = [];
+    if (act === "solo_track") {
+      var keep = {}, tl = asArray(a.tracks);
+      for (var i = 0; i < tl.length; i++) keep[String(tl[i]).toUpperCase()] = 1;
+      for (var t = 0; t < s.audioTracks.numTracks; t++) { var lab = "A" + (t + 1); s.audioTracks[t].setMute(keep[lab] ? 0 : 1); out.push({ track: lab, muted: !!s.audioTracks[t].isMuted() }); }
+      return { tracks: out };
+    }
+    var list = audioTargets(s, requireClips(s, a.clips), a.include_linked);
+    for (var j = 0; j < list.length; j++) {
+      var e = list[j], c = e.clip, d = { id: String(c.nodeId), track: e.track };
+      if (act === "mute" || act === "unmute") { c.disabled = act === "mute"; d.muted = !!c.disabled; d.verified = d.muted === (act === "mute"); }
+      else if (act === "pan") {
+        // Clip panner (Effect Controls > Panner): QE param "Pan" (mono) or "Balance" (stereo), -100..100, as a string.
+        var qc = qeClipFor(s, e), pc = qc.getClipPanComponent();
+        if (!pc) fail("UNSUPPORTED_IN_PREMIERE", "This clip has no panner (e.g. on a mono track).");
+        var pl = pc.getParamList(), pname = pl && pl.length ? String(pl[0]) : "Pan";
+        pc.setParamValue(pname, String(a.pan));
+        d.pan = parseFloat(String(pc.getParamValue(pname)).replace(",", "."));
+        d.param = pname;
+        d.verified = Math.abs(d.pan - a.pan) < 0.5;
+      } else if (act === "gain") {
+        // Clip gain is read-only for scripts: the Amplify effect gives the same result.
+        // Its Gain parameter is normalized: dB = 144 * value - 96 (-96..+48 dB).
+        if (!(a.db >= -96 && a.db <= 48)) fail("BAD_ARGS", "gain db must be between -96 and 48.");
+        var amp = findComponent(c, "Amplify");
+        if (!amp) amp = addEffect(s, e, "audio", resolveCatalogName("audio", "Amplify"), null);
+        if (!amp) fail("EFFECT_UNKNOWN", "Could not add Amplify.");
+        var gp = null;
+        for (var q = 0; q < amp.properties.numItems; q++) if (/^(gain|ganho)$/i.test(amp.properties[q].displayName)) gp = amp.properties[q];
+        if (!gp) gp = amp.properties[3];
+        if (gp.isTimeVarying()) gp.setTimeVarying(false);
+        gp.setValue((a.db + 96) / 144, UPDATE_UI);
+        var back = 144 * gp.getValue() - 96;
+        d.gainDb = r3(back);
+        d.verified = Math.abs(back - a.db) < 0.1;
+      } else fail("BAD_ARGS", "Unknown audio action " + act);
+      out.push(d);
+    }
+    var v = true; for (var z = 0; z < out.length; z++) if (out[z].verified === false) v = false;
+    return { clips: out, verified: v };
+  };
+  // Source media ranges of clips (for loudness, beats, silence analysis on the server).
+  H.clip_media = function (a) {
+    var s = getSequence(a.sequence), list = requireClips(s, a.clips), out = [];
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i].clip, sp = clipSpeed(c), d = { id: String(c.nodeId), track: list[i].track, video: list[i].video, name: c.name, start: r3(tsec(c.start)), end: r3(tsec(c.end)), "in": r3(tsec(c.inPoint) * sp), out: r3(tsec(c.outPoint) * sp), speed: sp };
+      try { d.media = itemMediaPath(c.projectItem); d.item = String(c.projectItem.nodeId); } catch (e) {}
+      try { if (c.isSpeedReversed()) d.reversed = true; } catch (e2) {}
+      try { d.disabled = !!c.disabled; } catch (e3) {}
+      try { var vp = volumeProp(c); d.volumeDb = vp.isTimeVarying() ? null : levelToDb(vp.getValue()); } catch (e4) {}
+      out.push(d);
+    }
+    return { clips: out, fps: r3(fps(s)), duration: r3(parseFloat(s.end) / TPS) };
+  };
+
+  // ---- 2.8 markers
+  H.update_markers = function (a) {
+    var ms = markerCollection(a), all = [], out = [];
+    var m = ms.getFirstMarker();
+    while (m) { all.push(m); m = ms.getNextMarker(m); }
+    var re = a.name_regex ? new RegExp(a.name_regex, "i") : null;
+    for (var i = 0; i < all.length; i++) {
+      var mk = all[i], st = tsec(mk.start);
+      if (a.guid && String(mk.guid) !== a.guid) continue;
+      if (has(a, "time") && Math.abs(st - a.time) > 0.02) continue;
+      if (re && !re.test(mk.name)) continue;
+      var u = a.update || {};
+      if (has(u, "name")) mk.name = u.name;
+      if (has(u, "comment")) mk.comments = u.comment;
+      if (has(u, "color")) try { mk.setColorByIndex(u.color); } catch (e) {}
+      if (has(u, "duration")) mk.end = st + u.duration;
+      if (has(u, "time")) { var dur = tsec(mk.end) - st; mk.start = u.time; mk.end = u.time + Math.max(0, dur); }
+      if (u.type === "chapter") mk.setTypeAsChapter(); else if (u.type === "segmentation") mk.setTypeAsSegmentation(); else if (u.type === "comment") mk.setTypeAsComment(); else if (u.type === "web") mk.setTypeAsWebLink(u.url || "", "");
+      out.push(markerInfo(mk));
+    }
+    if (!out.length) fail("MARKER_NOT_FOUND", "No marker matched.");
+    return { updated: out, verified: true };
+  };
+
+  // ---- 2.10 navigation and playback
+  H.navigate = function (a) {
+    var s = getSequence(a.sequence), act = a.action, cur = tsec(s.getPlayerPosition()), target = null, eps = 0.5 / fps(s);
+    if (act === "next_edit" || act === "prev_edit") {
+      var pts = {}, tracks = a.tracks ? asArray(a.tracks) : null;
+      eachClip(s, function (c, label) { if (tracks && !inList(tracks, label)) return; pts[r3(tsec(c.start))] = 1; pts[r3(tsec(c.end))] = 1; });
+      var list = []; for (var k in pts) if (pts.hasOwnProperty(k)) list.push(parseFloat(k));
+      list.sort(function (x, y) { return x - y; });
+      for (var i = 0; i < list.length; i++) { if (act === "next_edit" && list[i] > cur + eps && target === null) target = list[i]; if (act === "prev_edit" && list[i] < cur - eps) target = list[i]; }
+    } else if (act === "next_marker" || act === "prev_marker") {
+      var m = s.markers.getFirstMarker();
+      while (m) { var t = tsec(m.start); if (act === "next_marker" && t > cur + eps && target === null) target = t; if (act === "prev_marker" && t < cur - eps) target = t; m = s.markers.getNextMarker(m); }
+    } else if (act === "clip") {
+      var f = findClip(s, a.clip);
+      if (!f) fail("CLIP_NOT_FOUND", "Clip not found: " + a.clip);
+      target = tsec(a.edge === "end" ? f.clip.end : f.clip.start);
+    } else if (act === "start") target = 0;
+    else if (act === "end") target = parseFloat(s.end) / TPS;
+    else if (act === "play" || act === "stop") {
+      var qs = qeSequenceFor(s);
+      if (act === "play") qs.player.play(a.speed || 1); else qs.player.stop();
+      return { playing: act === "play" };
+    } else fail("BAD_ARGS", "Unknown action " + act);
+    if (target === null) return { moved: false, playhead: r3(cur), note: "Nothing found in that direction." };
+    s.setPlayerPosition(String(secToTicks(target)));
+    var now = tsec(s.getPlayerPosition());
+    return { moved: true, playhead: r3(now), verified: Math.abs(now - target) < 0.02 };
+  };
+  H.workspace = function (a) {
+    var list = app.getWorkspaces();
+    if (!a.name) return { workspaces: list };
+    var hit = null;
+    for (var i = 0; i < list.length; i++) if (lower(list[i]) === lower(a.name)) hit = list[i];
+    if (!hit) fail("BAD_ARGS", "Unknown workspace '" + a.name + "'.", "Available: " + list.join(", "));
+    app.setWorkspace(hit);
+    return { workspace: hit };
+  };
+
+  // ---- 2.9 export and delivery
+  H.encode = function (a) {
+    var enc = app.encoder, act = a.action;
+    if (act === "launch") { enc.launchEncoder(); return { launched: true }; }
+    if (act === "start") { enc.startBatch(); return { started: true }; }
+    var range = { entire: enc.ENCODE_ENTIRE, in_out: enc.ENCODE_IN_TO_OUT, work_area: enc.ENCODE_WORKAREA }[a.range || "entire"];
+    var out = new File(a.output), preset = new File(a.preset_path);
+    if (!preset.exists) fail("FILE_NOT_FOUND", "Preset not found: " + a.preset_path);
+    ensureParentFolder(out.fsName);
+    enc.launchEncoder();
+    var job = null;
+    if (act === "item") job = enc.encodeProjectItem(resolveItem(a.item), out.fsName, preset.fsName, range, a.remove_on_done ? 1 : 0);
+    else if (act === "sequence") job = enc.encodeSequence(getSequence(a.sequence), out.fsName, preset.fsName, range, a.remove_on_done ? 1 : 0);
+    else if (act === "file") {
+      var src = new File(a.file);
+      if (!src.exists) fail("FILE_NOT_FOUND", "File not found: " + a.file);
+      job = enc.encodeFile(src.fsName, out.fsName, preset.fsName, has(a, "in") ? a["in"] : 0, has(a, "out") ? a.out : 0, a.remove_on_done ? 1 : 0);
+    } else fail("BAD_ARGS", "Unknown encode action " + act);
+    if (a.start !== false) enc.startBatch();
+    return { jobId: job ? String(job) : null, output: out.fsName, queued: !!job };
+  };
+  H.export_extra = function (a) {
+    var s = getSequence(a.sequence), f = ensureParentFolder(a.path);
+    if (a.format === "omf") {
+      if (!(parseFloat(s.end) > 0)) fail("EMPTY_SEQUENCE", "Sequence '" + s.name + "' is empty.");
+      var ok = null, err = null;
+      // exportOMF can throw "Unknown error exception" and still write the file: judge by the file.
+      try { ok = requireProject().exportOMF(s, f.fsName, a.title || s.name, a.sample_rate || 48000, a.bits || 16, a.encapsulate === false ? 0 : 1, 0, a.trim ? 1 : 0, a.handle_frames || 0, a.include_pan ? 1 : 0); } catch (eO) { err = String(eO); }
+      var ex = new File(f.fsName).exists;
+      if (!ex) fail("EXPORT_FAILED", "Premiere did not write " + f.fsName + (err ? " (" + err + ")" : "") + ".");
+      return { path: f.fsName, ok: !!ok, exists: ex, verified: ex };
+    }
+    if (a.format === "project") {
+      s.exportAsProject(f.fsName);
+      return { path: f.fsName, exists: new File(f.fsName).exists, verified: new File(f.fsName).exists };
+    }
+    fail("BAD_ARGS", "Unknown format " + a.format);
+  };
+
   // ---- undo / misc
   // Premiere has no undo groups, and ExtendScript DOM setters (TrackItem
   // start/end/inPoint/outPoint, move) never reach its undo stack. So every
@@ -2922,10 +3972,10 @@
   var READ_ONLY = {
     ping: 1, get_state: 1, project_info: 1, list_project_items: 1, get_item_info: 1, list_sequences: 1, get_sequence_settings: 1,
     get_playhead: 1, get_timeline: 1, get_selection: 1, find_clips: 1, list_available_effects: 1, get_clip_effects: 1,
-    list_markers: 1, get_mogrt_params: 1, check_project: 1, undo: 1, redo: 1, undo_history: 1, save_project: 1, scene_sources: 1, select_project: 1, close_other_projects: 1
+    list_markers: 1, get_mogrt_params: 1, check_project: 1, inspect_media: 1, timeline_summary: 1, search_items: 1, inspect_state: 1, inspect_clip: 1, media_items: 1, color_read: 1, analysis_status: 1, clip_media: 1, workspace: 1, undo: 1, redo: 1, undo_history: 1, save_project: 1, scene_sources: 1, select_project: 1, close_other_projects: 1
   };
   // Handlers that change existing clips through DOM setters: snapshot their clips.
-  var SNAPSHOT_FNS = { set_speed: 1, trim_clips: 1, move_clips: 1, set_clips: 1, close_gaps: 1 };
+  var SNAPSHOT_FNS = { set_speed: 1, trim_clips: 1, move_clips: 1, set_clips: 1, close_gaps: 1, edit_qe: 1, edit_misc: 1 };
   function undoIndex() { try { ensureQE(); return Number(qe.project.undoStackIndex()); } catch (e) { return null; } }
   function projectKey() { try { return String(app.project.path); } catch (e) { return ""; } }
   function snapClip(c) {
@@ -3064,7 +4114,7 @@
   // works on another sequence (export_frames with sequence: "Vert"...) never
   // leaves later calls without a sequence argument pointing at it.
   var SWITCHES_PROJECT = { new_project: 1, open_project: 1, close_project: 1, select_project: 1, close_other_projects: 1, batch: 1, eval_script: 1 };
-  var KEEPS_ACTIVE = { open_sequence: 1, create_sequence: 1, new_project: 1, open_project: 1, close_project: 1, delete_sequence: 1, save_project_as: 1, eval_script: 1, duplicate_sequence: 1, auto_reframe: 1, create_subsequence: 1, ping: 1, get_state: 1, select_project: 1, close_other_projects: 1, check_project: 1 };
+  var KEEPS_ACTIVE = { open_sequence: 1, create_sequence: 1, new_project: 1, open_project: 1, close_project: 1, delete_sequence: 1, save_project_as: 1, eval_script: 1, duplicate_sequence: 1, auto_reframe: 1, create_subsequence: 1, ping: 1, get_state: 1, select_project: 1, close_other_projects: 1, check_project: 1, import_special: 1 };
   function restoreActive(orig) {
     try {
       // Closing every sequence tab of a project (fast batches) can make

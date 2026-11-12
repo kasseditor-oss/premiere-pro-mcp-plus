@@ -2,18 +2,18 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { BridgeError } from "./bridge.js";
+import { BridgeError, packageRoot } from "./bridge.js";
 
 /**
  * Second backend: a UXP plugin inside Premiere (25.6+) connects to this
  * WebSocket server (127.0.0.1 only, token in the URL). The plugin reads the
- * port and the token from <bridgeDir>/uxp.json, written here.
+ * port and the token from <bridgeDir>/uxp-servers/<pid>.json, written here.
  *
- * Only one MCP server process can own the port; the others report the UXP
- * backend as "owned by another server" and keep retrying in case it exits.
+ * Each MCP server process listens on its own port (PREMIERE_MCP_UXP_PORT or a free
+ * one) and the plugin connects to all of them.
  */
 export class UxpConnector {
-  readonly port = Number(process.env.PREMIERE_MCP_UXP_PORT || 47653);
+  port = Number(process.env.PREMIERE_MCP_UXP_PORT || 0);
   readonly token = process.env.PREMIERE_MCP_UXP_TOKEN || randomBytes(16).toString("hex");
   private wss: WebSocketServer | null = null;
   private sock: WebSocket | null = null;
@@ -21,6 +21,9 @@ export class UxpConnector {
   private pending = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void; timer: NodeJS.Timeout }>();
   private probeData: any = null;
   state: "off" | "listening" | "connected" | "port_in_use" | "disabled" = "off";
+  /** Handlers the plugin loaded (from its "ready" message). */
+  handlers: string[] = [];
+  private regFile = "";
   connectedAt = 0;
 
   constructor(private dir: string) {
@@ -36,8 +39,26 @@ export class UxpConnector {
     wss.on("listening", () => {
       this.wss = wss;
       this.state = "listening";
+      this.port = (wss.address() as any).port;
+      // Register in the folder the UXP loader scans (one file per server process).
       try {
-        fs.writeFileSync(path.join(this.dir, "uxp.json"), JSON.stringify({ port: this.port, token: this.token, pid: process.pid }), "utf-8");
+        const reg = path.join(this.dir, "uxp-servers");
+        fs.mkdirSync(reg, { recursive: true });
+        this.regFile = path.join(reg, `${process.pid}.json`);
+        fs.writeFileSync(this.regFile, JSON.stringify({ port: this.port, token: this.token, pid: process.pid }), "utf-8");
+        // Drop registrations of processes that are gone.
+        for (const f of fs.readdirSync(reg)) {
+          const pid = Number(f.replace(/.json$/, ""));
+          if (pid && pid !== process.pid) {
+            try {
+              process.kill(pid, 0);
+            } catch {
+              fs.rmSync(path.join(reg, f), { force: true });
+            }
+          }
+        }
+        const cleanup = () => fs.rmSync(this.regFile, { force: true });
+        process.once("exit", cleanup);
       } catch {
         /* ignore */
       }
@@ -68,11 +89,23 @@ export class UxpConnector {
       this.state = "connected";
       this.connectedAt = Date.now();
       this.probeData = null;
+      this.handlers = [];
+      // Send the handler code: the plugin is only a loader.
+      try {
+        const code = fs.readFileSync(path.join(packageRoot(), "uxp", "handlers.js"), "utf-8");
+        ws.send(JSON.stringify({ type: "code", code }));
+      } catch {
+        /* ignore */
+      }
       ws.on("message", (raw) => {
         let m: any;
         try {
           m = JSON.parse(String(raw));
         } catch {
+          return;
+        }
+        if (m.type === "ready") {
+          this.handlers = m.handlers || [];
           return;
         }
         const p = this.pending.get(m.id);

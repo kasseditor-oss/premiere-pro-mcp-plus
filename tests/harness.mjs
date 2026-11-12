@@ -11,9 +11,16 @@ export const near = (a, b, tol = 0.05) => typeof a === "number" && Math.abs(a - 
  * check (get_timeline, find_clips...), never trust the write result alone.
  */
 export async function suite(name, dir, env = {}) {
-  const c = await connect(env);
+  const raw = await connect(env);
   const results = [];
   const ctx = {};
+  // Safety: once the test project exists, every call carries expected_project_path,
+  // so a test can never edit another open project (the server answers PROJECT_MISMATCH).
+  const SKIP = new Set(["project_file", "premiere_status", "bridge_stats", "jobs", "analyze_media", "list_export_presets", "list_effect_presets", "undo", "batch"]);
+  const c = {
+    ...raw,
+    call: (tool, args = {}) => raw.call(tool, ctx.projectPath && !SKIP.has(tool) && !args.expected_project_path && !args.project ? { ...args, expected_project_path: ctx.projectPath } : args),
+  };
   async function step(title, tool, args, check) {
     const r = await c.call(tool, typeof args === "function" ? args() : args);
     let pass = r.ok;
@@ -44,10 +51,10 @@ export async function suite(name, dir, env = {}) {
     results.push({ name: title, tool: "-", pass, ms: 0, note });
     console.log(`${pass ? "PASS" : "FAIL"}  ${title.padEnd(48)}          ${note.slice(0, 170)}`);
   }
-  async function setup({ sequence = true } = {}) {
+  async function setup({ sequence = true, extra = [] } = {}) {
     const proj = path.join(dir, `${name}-${Date.now()}.prproj`);
     await step("new project", "project_file", { action: "new", path: proj }, (d) => (ctx.projectPath = d.path) && d.created);
-    const files = ["clipA.mp4", "clipB.mp4", "still.png", "vo.wav", "talk.wav", "noaudio.mp4", "redblue.mp4"].map((f) => path.join(dir, f)).filter((f) => fs.existsSync(f));
+    const files = ["clipA.mp4", "clipB.mp4", "still.png", "vo.wav", "talk.wav", "noaudio.mp4", "redblue.mp4", ...extra].map((f) => path.join(dir, f)).filter((f) => fs.existsSync(f));
     await step("import media", "import_media", { paths: files, bin: "Test" }, (d) => {
       for (const it of d.imported) if (!ctx[it.name]) ctx[it.name] = it.id;
       return d.count >= 4 && `${d.count} items`;
