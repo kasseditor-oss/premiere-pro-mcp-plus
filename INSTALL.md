@@ -53,15 +53,18 @@ Then tell the user to **restart Claude Desktop** and **Premiere Pro**.
 
 ## Optional: live end-to-end test
 
-With Premiere open, this creates a throw-away project in `D:/mcp-plus-test`
-(pass another folder as the argument) and exercises 40 operations:
+With Premiere open, this creates a throw-away project in the media folder
+(pass it as the argument) and runs 123 operations, each checked by re-reading
+the timeline. It closes its project at the end when another project is open.
 
 ```bash
 node tests/e2e-premiere.mjs D:/mcp-plus-test
+node bench/bench.mjs D:/mcp-plus-test      # speed on a clean project
 ```
 
 The folder needs a few media files; generate them with FFmpeg as in
-`tests/README.md`.
+`tests/README.md`. Close other projects in Premiere first: with several
+projects open, edits are slower.
 
 ## Uninstall
 

@@ -1,0 +1,38 @@
+{
+ "date": "2026-11-12T04:47:39.424Z",
+ "premiere": "26.5.2",
+ "lib": "39cab75f3185b471",
+ "results": {
+  "place_clips video": {
+   "totalMs": 5826,
+   "perItemMs": 58,
+   "n": 100
+  },
+  "place_clips audio": {
+   "totalMs": 7287,
+   "perItemMs": 73,
+   "n": 100
+  },
+  "place_clips V+A transform+keyframes": {
+   "totalMs": 9749,
+   "perItemMs": 97,
+   "n": 100
+  },
+  "apply_effects": {
+   "totalMs": 9583,
+   "perItemMs": 96,
+   "n": 100
+  },
+  "get_timeline compact (400 clips)": {
+   "totalMs": 1053,
+   "perItemMs": 1053,
+   "n": 1
+  },
+  "premiere_status (x20)": {
+   "totalMs": 753,
+   "perItemMs": 38,
+   "n": 20
+  },
+  "toolsListBytes": 81140
+ }
+}

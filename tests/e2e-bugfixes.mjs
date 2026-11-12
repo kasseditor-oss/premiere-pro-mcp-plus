@@ -172,6 +172,12 @@ await check("10d scene_edit_detection returns markers list", async () => {
   return { pass: r.ok && Array.isArray(r.markers), note: `${r.markers.length} markers` };
 });
 
+// Close the test project (saved) when another project is open; closing the
+// only open project can take Premiere down, so it stays open then.
+{
+  const st = (await c.call("premiere_status", {})).data;
+  if ((st.projects || []).length > 1) await c.call("project_file", { action: "close", save: true });
+}
 c.close();
 const passed = results.filter((r) => r.pass).length;
 console.log(`\n${passed}/${results.length} passed`);

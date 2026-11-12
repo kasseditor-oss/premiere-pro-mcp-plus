@@ -16,7 +16,7 @@ async function step(name, tool, args, check) {
   let note = "";
   if (pass && check) {
     try {
-      const v = check(r.data, r);
+      const v = await check(r.data, r);
       if (v === false) pass = false;
       else if (typeof v === "string") note = v;
     } catch (e) {
@@ -27,14 +27,25 @@ async function step(name, tool, args, check) {
   if (!r.ok) note = typeof r.data === "object" ? `${r.data.code}: ${r.data.error}` : String(r.data);
   results.push({ name, tool, pass, ms: r.ms, note });
   console.log(`${pass ? "PASS" : "FAIL"}  ${name.padEnd(42)} ${String(r.ms).padStart(6)}ms  ${note.slice(0, 160)}`);
+  // Guard: the active project must stay the test project.
+  if (ctx.projectPath && tool !== "project_file") {
+    const st = await c.call("premiere_status", {});
+    const cur = st.data?.project?.path || "";
+    if (cur.toLowerCase() !== ctx.projectPath.toLowerCase()) {
+      console.log(`      !! active project changed after "${name}": ${cur}`);
+      results.push({ name: `active project kept after ${name}`, tool, pass: false, ms: 0, note: cur });
+    }
+  }
   return r;
 }
 
 const proj = path.join(DIR, `e2e-${Date.now()}.prproj`);
 await step("status", "premiere_status", {}, (d) => d.connected === true && `Premiere ${d.premiere}, locale ${d.locale}`);
-await step("new project", "project_file", { action: "new", path: proj }, (d) => d.created);
+await step("new project", "project_file", { action: "new", path: proj }, (d) => (ctx.projectPath = d.path) && d.created);
 await step("import folder into bin", "import_media", { folder: DIR, bin: "Test" }, (d) => {
-  for (const it of d.imported) ctx[it.name] = it.id;
+  // Only files at the root of the media folder, first occurrence (an imported
+  // FCP XML would bring items with the same names).
+  for (const it of d.imported) if (!ctx[it.name] && it.type !== "bin" && it.media && path.dirname(it.media).toLowerCase() === DIR.toLowerCase()) ctx[it.name] = it.id;
   return d.count >= 5 ? `${d.count} items` : false;
 });
 await step("list project items", "list_project_items", { bin: "Test", details: true }, (d) => d.total >= 5 && d.items.map((i) => `${i.name}:${i.duration}`).join(" "));
@@ -104,7 +115,7 @@ await step("export 4 frames as contact sheet", "export_frames", { times: [0.2, 1
   ctx.sheet = d.sheet;
   return d.failed === 0 && r.images.length === 1 && `sheet ${d.sheet}`;
 });
-await step("export FCP XML (no dialog)", "export_interchange", { format: "fcp_xml", path: path.join(DIR, "e2e.xml") }, (d) => d.exists && fs.statSync(d.path).size > 1000 && `${fs.statSync(d.path).size} bytes`);
+await step("export FCP XML (no dialog)", "export_interchange", { format: "fcp_xml", path: path.join(os.tmpdir(), "premiere-mcp-plus-e2e", "e2e.xml") }, (d) => d.exists && fs.statSync(d.path).size > 1000 && `${fs.statSync(d.path).size} bytes`);
 await step("import captions SRT", "import_captions", { path: path.join(DIR, "subs.srt") }, (d) => d.ok);
 await step("analyze silence (ffmpeg)", "analyze_media", { action: "silence", file: path.join(DIR, "talk.wav") }, (d) => d.count >= 1 && JSON.stringify(d.silences));
 await step("analyze probe", "analyze_media", { action: "probe", file: path.join(DIR, "clipA.mp4") }, (d) => d.streams.length === 2 && `${d.duration}s`);
@@ -246,22 +257,200 @@ await step("extra: blurs read 22 and 11", "get_clip_effects", () => ({ clips: ct
   return vals.length === 2 && vals.includes(11) && vals.includes(22) ? `Amount ${vals.join(", ")}` : false;
 });
 
+// Wait until Premiere's background work (peak files, conforming, analysis) is done,
+// so speed tests measure the tools and not a busy Premiere.
+async function waitIdle(maxS = 60) {
+  for (let i = 0; i < maxS; i++) {
+    const r = await c.call("run_extendscript", { code: "app.enableQE(); return [qe.project.numActiveProgressItems, qe.project.isAudioConforming, qe.project.isAudioPeakGenerating, qe.project.isIndexing];" });
+    const st = r.data.result || [];
+    if (!st[0] && !st[1] && !st[2] && !st[3]) return i;
+    await new Promise((res) => setTimeout(res, 1000));
+  }
+  return maxS;
+}
 // 15. batch speed (Premiere-dependent; target < 80 ms per simple clip)
+await waitIdle();
 {
   const n = 100;
   const r = await c.call("place_clips", { clips: Array.from({ length: n }, (_, i) => ({ item: ctx["clipA.mp4"], track: "V7", start: 100 + i * 0.5, in: i % 10, out: (i % 10) + 0.5, media: "video" })) });
   const per = Math.round(r.ms / n);
-  const pass = r.ok && r.data.placed.length === n && per < 150;
-  results.push({ name: "fix15 place 100 video clips", pass, ms: r.ms, note: `${per} ms/clip${per < 80 ? "" : " (target 80)"}` });
-  console.log(`${pass ? "PASS" : "FAIL"}  ${"fix15 place 100 video clips".padEnd(42)} ${String(r.ms).padStart(6)}ms  ${per} ms/clip`);
+  // Speed is measured by bench/bench.mjs on a clean project; here only correctness.
+  const pass = r.ok && r.data.placed.length === n && r.data.placed.every((p, i) => Math.abs(p.start - (100 + i * 0.5)) < 0.02 && Math.abs(p.in - (i % 10)) < 0.02);
+  results.push({ name: "fix15 place 100 video clips", pass, ms: r.ms, note: `${per} ms/clip${per < 80 ? "" : " (target 80)"}` + (pass ? "" : " " + JSON.stringify(r.data.errors?.[0] || r.data).slice(0, 200)) });
+  console.log(`${pass ? "PASS" : "FAIL"}  ${"fix15 place 100 video clips".padEnd(42)} ${String(r.ms).padStart(6)}ms  ${results[results.length - 1].note}`);
   const e = await c.call("apply_effects", { clips: { tracks: ["V7"] }, effects: ["Gaussian Blur"] });
   const perE = Math.round(e.ms / n);
-  const passE = e.ok && e.data.applied === n && perE < 150;
+  const passE = e.ok && e.data.applied === n;
   results.push({ name: "fix15 apply_effects on 100 clips", pass: passE, ms: e.ms, note: `${perE} ms/clip` });
   console.log(`${passE ? "PASS" : "FAIL"}  ${"fix15 apply_effects on 100 clips".padEnd(42)} ${String(e.ms).padStart(6)}ms  ${perE} ms/clip`);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 0: bug report against c92562b (PROMPT-agente.md, items 1-27). Every
+// timeline check re-reads the timeline instead of trusting the tool result.
+// ---------------------------------------------------------------------------
+const tlClips = async (tracks, seq) => {
+  const r = await c.call("get_timeline", { tracks, sequence: seq, include_effects: false, include_media: false });
+  return (r.data.tracks || []).flatMap((t) => t.clips.map((k) => ({ ...k, track: t.track })));
+};
+const near = (a, b, e = 0.02) => Math.abs(a - b) <= e;
+const noAudio = path.join(DIR, "noaudio.mp4");
+if (!fs.existsSync(noAudio)) {
+  const { execFileSync } = await import("node:child_process");
+  execFileSync("ffmpeg", ["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", noAudio]);
+}
+await step("p0 new sequence F0", "create_sequence", { name: "F0", width: 1920, height: 1080, fps: 30 }, (d) => d.name === "F0");
+await step("p0 import video without audio", "import_media", { paths: [noAudio] }, (d) => (ctx.noaudio = d.imported[0]?.id) && "ok");
+
+// 1. media "audio" never touches video tracks
+await step("p0-1 place V1 video 0-3", "place_clips", () => ({ clips: [{ item: ctx["clipA.mp4"], track: "V1", start: 0, in: 0, out: 3, media: "video" }] }), (d) => d.placed.length === 1);
+await step("p0-1 media audio -> no ghost video", "place_clips", () => ({ clips: [{ item: ctx["clipB.mp4"], track: "A1", start: 1, in: 0, out: 0.5, media: "audio" }] }), async (d) => {
+  const v = await tlClips(["V1", "V2", "V3"]), a = await tlClips(["A1"]);
+  return d.placed[0]?.audioOnly && v.length === 1 && near(v[0].end, 3) && a.some((x) => near(x.start, 1) && near(x.end, 1.5)) ? `video untouched (${v.map((x) => x.start + "-" + x.end)}), A1 1-1.5` : false;
+});
+{
+  const r = await c.call("place_clips", { clips: [{ item: ctx.noaudio, track: "A2", start: 0, media: "audio" }] });
+  const pass = r.ok && r.data.errors[0]?.code === "NO_AUDIO" && (await tlClips(["A2"])).length === 0;
+  results.push({ name: "p0-1 audio from video-only file -> NO_AUDIO", pass, ms: r.ms, note: r.data.errors?.[0]?.code });
+  console.log(`${pass ? "PASS" : "FAIL"}  ${"p0-1 audio from video-only file -> NO_AUDIO".padEnd(42)} ${String(r.ms).padStart(6)}ms`);
+}
+
+// 3 / 7 / 22. linked clips move together; unlink / link really work
+await step("p0-3 place V2+A2 4-6", "place_clips", () => ({ clips: [{ item: ctx["clipA.mp4"], track: "V2", audio_track: "A2", start: 4, in: 0, out: 2 }] }), (d) => (ctx.p3 = d.placed[0].id) && "ok");
+await step("p0-3 move delta 10 moves A2 too", "edit_clips", () => ({ action: "move", clips: ctx.p3, delta: 10 }), async () => {
+  const v = await tlClips(["V2"]), a = await tlClips(["A2"]);
+  return v.some((x) => near(x.start, 14)) && a.some((x) => near(x.start, 14)) && !a.some((x) => near(x.start, 4)) ? "V2 and A2 at 14-16" : false;
+});
+await step("p0-7 unlink", "edit_clips", () => ({ action: "unlink", clips: ctx.p3 }), (d) => d.ok);
+await step("p0-7 move after unlink moves only video", "edit_clips", () => ({ action: "move", clips: ctx.p3, delta: 1 }), async () => {
+  const v = await tlClips(["V2"]), a = await tlClips(["A2"]);
+  ctx.p3a = a.find((x) => near(x.start, 14))?.id;
+  return v.some((x) => near(x.start, 15)) && !!ctx.p3a ? "V2 15, A2 stays 14" : false;
+});
+await step("p0-7 link V2 + A2 again", "edit_clips", () => ({ action: "link", clips: [ctx.p3, ctx.p3a].filter(Boolean) }), (d) => (d.ok && d.clips.length === 2 ? "linked" : false));
+await step("p0-22 razor V2 only (include_linked false)", "razor", { times: [15.5], tracks: ["V2"], include_linked: false }, async (d) => {
+  const v = await tlClips(["V2"]), a = await tlClips(["A2"]);
+  return d.cuts === 1 && v.length === 2 && a.length === 1 ? "V2 cut, A2 intact" : false;
+});
+
+// 4. trim validates the media range
+{
+  const before = JSON.stringify(await tlClips(["V2"]));
+  const r = await c.call("edit_clips", { action: "trim", clips: ctx.p3, out: 50 });
+  const pass = !r.ok && r.data.code === "BAD_ARGS" && JSON.stringify(await tlClips(["V2"])) === before;
+  results.push({ name: "p0-4 trim out past media -> BAD_ARGS", pass, ms: r.ms, note: r.data.code });
+  console.log(`${pass ? "PASS" : "FAIL"}  ${"p0-4 trim out past media -> BAD_ARGS".padEnd(42)} ${String(r.ms).padStart(6)}ms  ${r.data.code}`);
+}
+
+// 5. speed with ripple pulls / pushes the following clips (video and audio)
+await step("p0-5 place 30-32 and 32-34 on V3/A3", "place_clips", () => ({ clips: [{ item: ctx["clipA.mp4"], track: "V3", audio_track: "A3", start: 30, in: 0, out: 2 }, { item: ctx["clipA.mp4"], track: "V3", audio_track: "A3", start: 32, in: 2, out: 4 }] }), (d) => d.placed.length === 2);
+await step("p0-5 speed 2 + ripple", "set_clip_speed", { clips: { tracks: ["V3"], at: 30.5 }, speed: 2, ripple: true }, async () => {
+  const v = await tlClips(["V3"]), a = await tlClips(["A3"]);
+  return v.some((x) => near(x.start, 31) && near(x.end, 33)) && a.some((x) => near(x.start, 31) && near(x.end, 33)) ? "second clip at 31-33 (V3 and A3)" : `V3 ${v.map((x) => x.start + "-" + x.end)} A3 ${a.map((x) => x.start + "-" + x.end)}`;
+});
+await step("p0-5 speed 0.5 + ripple pushes", "set_clip_speed", { clips: { tracks: ["V3"], at: 30.5 }, speed: 0.5, ripple: true }, async () => {
+  const v = await tlClips(["V3"]);
+  return v.some((x) => near(x.start, 30) && near(x.end, 34)) && v.some((x) => near(x.start, 34) && near(x.end, 36)) ? "30-34 then 34-36" : `V3 ${v.map((x) => x.start + "-" + x.end)}`;
+});
+
+// 8. volume_db on a clip with video and audio
+await step("p0-8 volume_db on V+A clip", "place_clips", () => ({ clips: [{ item: ctx["clipA.mp4"], track: "V4", audio_track: "A4", start: 40, in: 0, out: 1, volume_db: -6 }] }), async (d) => {
+  if (d.placed.length !== 1) return false;
+  const e = await c.call("get_clip_effects", { clips: { tracks: ["A4"], at: 40.5 } });
+  const lvl = e.data.clips[0].components.find((x) => x.matchName === "Internal Volume" || /^Volume/.test(x.name))?.props[1]?.value;
+  return near(lvl, Math.pow(10, (-6 - 15) / 20), 0.002) ? `audio level ${lvl} (-6 dB)` : `level ${lvl}`;
+});
+
+// 12. locked track
+await step("p0-12 lock V4", "manage_tracks", { action: "set", tracks: ["V4"], lock: true }, () => true);
+{
+  const before = (await tlClips(["V4"])).length;
+  const r = await c.call("place_clips", { clips: [{ item: ctx["clipA.mp4"], track: "V4", start: 0, in: 0, out: 1 }] });
+  const pass = r.ok && r.data.errors[0]?.code === "TRACK_LOCKED" && (await tlClips(["V4"])).length === before;
+  results.push({ name: "p0-12 place on locked track -> TRACK_LOCKED", pass, ms: r.ms, note: r.data.errors?.[0]?.code });
+  console.log(`${pass ? "PASS" : "FAIL"}  ${"p0-12 place on locked track -> TRACK_LOCKED".padEnd(42)} ${String(r.ms).padStart(6)}ms`);
+}
+await step("p0-12 unlock V4", "manage_tracks", { action: "set", tracks: ["V4"], lock: false }, () => true);
+
+// 11. undo / redo by call
+await step("p0-11 place clip to undo", "place_clips", () => ({ clips: [{ item: ctx["still.png"], track: "V5", start: 60, duration: 1 }] }), (d) => d.placed.length === 1);
+await step("p0-11 undo calls 1", "undo", { calls: 1 }, async (d) => d.undoneCalls[0] === "place_clips" && (await tlClips(["V5"])).length === 0 && "clip gone");
+await step("p0-11 redo calls 1", "undo", { redo: true, calls: 1 }, async (d) => d.redoneCalls[0] === "place_clips" && (await tlClips(["V5"])).length === 1 && "clip back");
+
+// 16 / 17. blend mode names, colors in hex
+await step("p0-16 blend_mode by name", "set_transform", { clips: { tracks: ["V5"] }, blend_mode: "multiply" }, (d) => d.clips[0]?.set.blend_mode === "multiply" && "multiply");
+await step("p0-16 unknown blend mode -> error", "set_properties", { clips: { tracks: ["V5"] }, set: [{ effect: "Opacity", property: "Blend Mode", value: "xyz" }] }, (d) => d.errors.length === 1 && d.set.length === 0);
+await step("p0-17 apply Tint", "apply_effects", { clips: { tracks: ["V5"] }, effects: ["Tint"] }, (d) => d.applied === 1);
+await step("p0-17 color returned as hex", "set_properties", { clips: { tracks: ["V5"] }, set: [{ effect: "Tint", property: "Map Black To", value: "#FF0000" }] }, (d) => d.set[0]?.value === "#FF0000" && "#FF0000");
+
+// 25. compact timeline
+await step("p0-25 get_timeline compact rows", "get_timeline", { compact: true }, (d, r) => Array.isArray(d.tracks[0].clips[0]) && d.fields.length === 6 && `${JSON.stringify(d).length} bytes`);
+
+// 9. sequence from a .sqpreset
+const sq = "C:/Program Files/Adobe/Adobe Premiere Pro 2026/Settings/SequencePresets/Broadcast/23.98p 4 mono discrete.sqpreset";
+if (fs.existsSync(sq)) await step("p0-9 create_sequence from .sqpreset", "create_sequence", { name: "FromPreset", preset_path: sq }, (d) => near(d.fps, 23.976, 0.01) && `${d.width}x${d.height}@${d.fps}`);
+await step("p0 back to F0", "open_sequence", { sequence: "F0" }, (d) => d.name === "F0");
+
+// 10 / 24. a tool working on another sequence restores the active one
+await step("p0-10 export_frames of another sequence", "export_frames", { sequence: "E2E", times: [0.5], return_images: false }, () => true);
+await step("p0-10 F0 still active", "premiere_status", {}, (d) => d.activeSequence?.name === "F0" && "F0");
+
+// 26. placement speed with transform + keyframes (video + audio)
+console.log(`      waited ${await waitIdle(120)} s for Premiere to be idle`);
+{
+  const n = 100;
+  const r = await c.call("place_clips", { clips: Array.from({ length: n }, (_, i) => ({ item: ctx["clipA.mp4"], track: "V8", audio_track: "A8", start: 200 + i * 0.5, in: i % 10, out: (i % 10) + 0.5, transform: { scale: 110, position: [960, 540] }, keyframes: [{ property: "Scale", keys: [{ t: 0, v: 100 }, { t: "end", v: 110 }] }] })) });
+  const per = Math.round(r.ms / n);
+  const pass = r.ok && r.data.placed.length === n && r.data.placed.every((p, i) => Math.abs(p.start - (200 + i * 0.5)) < 0.02);
+  if (!r.data.fastBatch) console.log('      (fast batch not used)');
+  results.push({ name: "p0-26 100 V+A clips with transform+keys", pass, ms: r.ms, note: `${per} ms/clip (target 120)` + (pass ? "" : " " + JSON.stringify(r.data.errors?.[0] || r.data).slice(0, 200)) });
+  console.log(`${pass ? "PASS" : "FAIL"}  ${"p0-26 100 V+A clips with transform+keys".padEnd(42)} ${String(r.ms).padStart(6)}ms  ${results[results.length - 1].note}`);
+}
+
+// 6. auto reframe
+await step("p0-6 auto_reframe F0 has clips", "sequence_tools", { action: "auto_reframe", sequence: "F0", numerator: 9, denominator: 16, name: "F0 vertical" }, (d) => d.clips > 0 && `${d.clips} clips, ${d.width}x${d.height}`);
+await expectError("p0-6 auto_reframe empty sequence", "sequence_tools", { action: "auto_reframe", sequence: "FromPreset" }, "EMPTY_SEQUENCE");
+
+// 2 / 20. AAF with an effect AAF cannot carry: dialog closed automatically
+await step("p0-2 Lumetri on V1", "apply_effects", { clips: { tracks: ["V1"] }, effects: ["Lumetri Color"] }, (d) => d.applied >= 1);
+await step("p0-2 AAF export, no hanging dialog", "export_interchange", { sequence: "F0", format: "aaf", path: path.join(os.tmpdir(), "premiere-mcp-plus-e2e", "f0.aaf") }, (d, r) =>
+  d.exists && r.ms < 60000 && d.ignoredEffects?.length ? `${r.ms} ms, ${d.warning}` : false,
+);
+
+// 13. unknown sequence fails fast
+await expectError("p0-13 export unknown sequence", "export_sequence", { sequence: "NaoExiste", output: path.join(os.tmpdir(), "x.mp4") }, "SEQUENCE_NOT_FOUND");
+results[results.length - 1].pass &&= results[results.length - 1].ms < 3000;
+
+// 14. subclip reports its own range
+await step("p0-14 subclip 1-3", "manage_project_items", () => ({ action: "subclip", items: [ctx["clipA.mp4"]], in: 1, out: 3, name: "sub 1-3" }), (d) => near(d.in, 1) && near(d.out, 3) && near(d.duration, 2));
+await step("p0-14 get_item_info of the subclip", "get_item_info", { item: "sub 1-3" }, (d) => near(d.in, 1) && near(d.out, 3) && near(d.duration, 2) && `in ${d.in} out ${d.out}`);
+
+// 15. preset search by format
+await step("p0-15 list_export_presets H.264", "list_export_presets", { filter: "H.264" }, (d) => d.count > 0 && d.presets.every((p) => p.format) && `${d.count} presets, e.g. ${d.presets[0].format}`);
+
+// 18. batch with tool names
+await step("p0-18 batch with tool names", "batch", { ops: [{ fn: "markers", args: { action: "add", markers: [{ time: 2, name: "batch" }] } }, { fn: "playhead", args: { seconds: 1 } }] }, (d) => d.failed === 0 && d.results.length === 2);
+
+// 19. track delete is verified
+await step("p0-19 add 2 tracks", "manage_tracks", { action: "add", video: 2 }, (d) => d.addedVideo === 2 && (ctx.nv = d.videoTracks));
+await step("p0-19 rename + lock the last one", "manage_tracks", () => ({ action: "set", tracks: ["V" + ctx.nv], name: "ToDelete", lock: true }), () => true);
+await step("p0-19 delete it", "manage_tracks", () => ({ action: "delete", tracks: ["V" + ctx.nv] }), async (d) => {
+  const names = (await c.call("run_extendscript", { code: "var s=app.project.activeSequence,o=[];for(var i=0;i<s.videoTracks.numTracks;i++)o.push(s.videoTracks[i].name);return o;" })).data.result;
+  return d.deleted[0]?.name === "ToDelete" && !names.includes("ToDelete") ? `${names.length} video tracks left` : false;
+});
+
+// 21. several projects
+await step("p0-21 status lists open projects", "premiere_status", {}, (d) => Array.isArray(d.projects) && d.projects.some((p) => p.active) && `${d.projects.length} open`);
+await expectError("p0-21 project that is not open", "get_timeline", { project: "nao-aberto.prproj" }, "PROJECT_MISMATCH");
+
 await step("save project", "project_file", { action: "save" }, (d) => d.saved);
+// 27. close the test project when other projects are open (closing the only
+// open project can take Premiere down, so it is kept open in that case).
+{
+  const st = (await c.call("premiere_status", {})).data;
+  if ((st.projects || []).length > 1) await step("close test project", "project_file", { action: "close", save: true }, (d) => d.closed);
+  else console.log("      (test project left open: it is the only open project)");
+}
 
 c.close();
 const passed = results.filter((r) => r.pass).length;

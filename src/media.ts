@@ -138,7 +138,24 @@ export function listMediaFiles(dir: string, recursive: boolean): { file: string;
   return out;
 }
 
-export function findExportPresets(filter?: string): { name: string; path: string; source: string }[] {
+/** FourCC stored in an .epr ExporterFileType (e.g. 1211250228 -> "H264"). */
+function fourcc(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return [24, 16, 8, 0].map((b) => String.fromCharCode((n >>> b) & 255)).join("").trim();
+}
+const FORMAT_NAMES: Record<string, string> = { H264: "H.264", HEVC: "HEVC (H.265)", MooV: "QuickTime", AVIV: "AVI", WAVE: "Waveform Audio", AIFF: "AIFF", MP3: "MP3", PNG: "PNG", JPEG: "JPEG", TIFF: "TIFF", DPX: "DPX", GIFf: "Animated GIF" };
+
+export interface ExportPreset {
+  name: string;
+  path: string;
+  source: string;
+  /** Format as Premiere groups it ("H.264", "HEVC (H.265)", "Apple ProRes"...). */
+  format?: string;
+  /** Preset folder ("System Presets/Broadcast/H.264"). */
+  folder?: string;
+}
+
+export function findExportPresets(filter?: string): ExportPreset[] {
   const roots = [
     "C:/Program Files/Adobe/Adobe Media Encoder 2026/MediaIO/systempresets",
     "C:/Program Files/Adobe/Adobe Media Encoder 2027/MediaIO/systempresets",
@@ -151,7 +168,7 @@ export function findExportPresets(filter?: string): { name: string; path: string
   ];
   const re = filter ? new RegExp(filter, "i") : null;
   const seen = new Set<string>();
-  const out: { name: string; path: string; source: string }[] = [];
+  const out: ExportPreset[] = [];
   const walk = (d: string, source: string, depth: number) => {
     let ents: fs.Dirent[] = [];
     try {
@@ -164,8 +181,13 @@ export function findExportPresets(filter?: string): { name: string; path: string
       if (e.isDirectory() && depth < 4) walk(full, source, depth + 1);
       else if (/\.epr$/i.test(e.name)) {
         let name = e.name.replace(/\.epr$/i, "");
+        let format = "";
+        let folder = "";
         try {
           const head = fs.readFileSync(full, "utf-8").slice(0, 4000);
+          folder = (/<FolderDisplayPath>([^<]*)<\/FolderDisplayPath>/.exec(head)?.[1] || "").trim();
+          const cc = fourcc(Number(/<ExporterFileType>(\d+)<\/ExporterFileType>/.exec(head)?.[1]));
+          format = (folder.includes("/") ? folder.split("/").pop() : "") || FORMAT_NAMES[cc] || cc;
           const n = /<PresetName>([^<]+)<\/PresetName>/.exec(head) || /<Name>([^<]+)<\/Name>/.exec(head);
           if (n) name = n[1];
           // Localization keys look like "$$$/AME/.../PresetName=H.264 (Match Source)"
@@ -176,9 +198,10 @@ export function findExportPresets(filter?: string): { name: string; path: string
         }
         const key = name + "|" + source;
         if (seen.has(key)) continue;
-        if (re && !re.test(name) && !re.test(full)) continue;
+        // The filter matches the name, the format ("H.264", "HEVC", "Apple ProRes"...), the folder or the path.
+        if (re && !re.test(name) && !re.test(format) && !re.test(folder) && !re.test(full)) continue;
         seen.add(key);
-        out.push({ name, path: full.replace(/\\/g, "/"), source });
+        out.push({ name, path: full.replace(/\\/g, "/"), source, format: format || undefined, folder: folder || undefined });
       }
     }
   };

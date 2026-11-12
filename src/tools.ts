@@ -92,9 +92,16 @@ function compact(v: unknown): string {
   return JSON.stringify(v, (_k, x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : x));
 }
 
+const projectArg = z.string().optional().describe("Open project to act on (name or .prproj path). Default: the active project.");
+// Tools that do not touch a project (or manage projects themselves).
+const NO_PROJECT_ARG = new Set(["premiere_status", "project_file", "analyze_media", "list_export_presets", "list_effect_presets", "batch", "undo"]);
+
 export function registerTools(server: McpServer, bridge: PremiereBridge) {
 
   const scratch = path.join(os.tmpdir(), "premiere-mcp-plus", "frames");
+
+  // Every tool, by name, for batch ops that use tool names (validated with the tool's own schema).
+  const toolRegistry = new Map<string, { schema: z.ZodTypeAny; handler: (args: any) => Promise<unknown> }>();
 
   function tool<S extends z.ZodRawShape>(
     name: string,
@@ -104,19 +111,31 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     annotations: (typeof ANN)[keyof typeof ANN],
     handler: (args: z.infer<z.ZodObject<S>>) => Promise<unknown | ToolResult>,
   ) {
+    // Every Premiere tool takes an optional project: the server makes that open
+    // project the active one first (or fails with PROJECT_MISMATCH), so a call
+    // never lands in another open project by accident.
+    const full = NO_PROJECT_ARG.has(name) ? shape : { ...shape, project: projectArg };
+    const run = async (args: any) => {
+      if (args?.project) {
+        await call("select_project", { project: args.project }, 30000);
+        delete args.project;
+      }
+      return handler(args);
+    };
+    toolRegistry.set(name, { schema: z.object(full), handler: run });
     server.registerTool(
       name,
       {
         title,
         description,
-        inputSchema: z.object(shape),
+        inputSchema: z.object(full),
         annotations: { title, ...annotations },
 
         _meta: { ui: { resourceUri: WIDGET_URI, visibility: ["model", "app"] }, "ui/resourceUri": WIDGET_URI },
       } as any,
       (async (args: any) => {
         try {
-          const out = await handler(args);
+          const out = await run(args);
           if (out && typeof out === "object" && Array.isArray((out as ToolResult).content)) return out as ToolResult;
           return { content: [{ type: "text", text: compact(out) }] };
         } catch (e: any) {
@@ -132,12 +151,15 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool("premiere_status", "Premiere status", "Check the connection to Premiere Pro and get version, open project, active sequence, bridge health. Call first when unsure.", {}, ANN.read, async () => {
     const hb = bridge.heartbeat();
     if (!hb.alive) return { connected: false, bridgeDir: bridge.dir, heartbeatAgeMs: hb.ageMs, fix: "Open Premiere Pro (extension auto-starts). If never installed: run `premiere-pro-mcp-plus --install-cep` and restart Premiere." };
-    const ping = await call("ping", {}, 15000);
-    return { connected: true, ...ping, busy: hb.busy, commandsServed: hb.count };
+    const [ping, dialogs] = await Promise.all([call("ping", {}, 15000) as Promise<any>, bridge.openDialogs()]);
+    const res: any = { connected: true, ...ping, busy: hb.busy, commandsServed: hb.count };
+    if (dialogs.length) res.dialogs = dialogs.map((d) => ({ title: d.title, text: d.text.slice(0, 300) }));
+    if (ping.projects && ping.projects.length > 1) res.warning = `${ping.projects.length} projects are open; tools act on the active one (${ping.project?.name}). Close the others or pass project to choose.`;
+    return res;
   });
 
   // ======================================================== project
-  tool("get_project", "Project overview", "Project name/path, item counts, all sequences, and the active sequence summary (size, fps, duration, tracks, playhead).", {}, ANN.read, () => call("get_state", {}));
+  tool("get_project", "Project overview", "Project name/path, item counts, all sequences, and the active sequence summary (size, fps, duration, tracks, playhead). compact: true returns only the count of sequences. Warns when several projects are open.", { compact: z.boolean().optional() }, ANN.read, (a) => call("get_state", a));
 
   tool(
     "list_project_items",
@@ -272,12 +294,20 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "project_file",
     "Project file",
-    "Save, save-as, open, create or close a project.",
-    { action: z.enum(["save", "save_as", "open", "new", "close"]), path: z.string().optional(), save: z.boolean().optional().describe("close: save first") },
+    "Save, save-as, open, create or close a project. new/open leave other projects open unless close_others: true (several open projects make it easy to act on the wrong one; premiere_status warns about it). close_others alone closes every project except the active one, without saving.",
+    {
+      action: z.enum(["save", "save_as", "open", "new", "close", "close_others"]),
+      path: z.string().optional(),
+      save: z.boolean().optional().describe("close: save first"),
+      close_others: z.boolean().optional().describe("new/open: close every other open project (unsaved changes in them are discarded)"),
+    },
     ANN.write,
-    (a) => {
+    async (a) => {
+      if (a.action === "close_others") return call("close_other_projects", {});
       const map: Record<string, string> = { save: "save_project", save_as: "save_project_as", open: "open_project", new: "new_project", close: "close_project" };
-      return call(map[a.action], { path: a.path ? path.resolve(a.path) : undefined, save: a.save }, 420000);
+      const r: any = await call(map[a.action], { path: a.path ? path.resolve(a.path) : undefined, save: a.save }, 420000);
+      if ((a.action === "new" || a.action === "open") && a.close_others) r.closedOthers = ((await call("close_other_projects", {})) as any).closed;
+      return r;
     },
   );
 
@@ -403,6 +433,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       include_effects: z.boolean().optional(),
       include_media: z.boolean().optional(),
       skip_empty: z.boolean().optional().describe("Omit tracks without clips (default true)"),
+      compact: z.boolean().optional().describe("One array row per clip [id, name, start, end, in, out] (no media, effects, speed or track states): smallest and fastest for big timelines. in/out are media seconds divided by the clip speed."),
     },
     ANN.read,
     (a) => call("get_timeline", { skip_empty: true, ...a }),
@@ -488,7 +519,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "edit_clips",
     "Edit clips",
-    "Move (by delta or to a time), move to another track, trim (start/end/in/out/duration, or trim_start/trim_end amounts), enable/disable, rename, color label, link/unlink.",
+    "Move (by delta or to a time), move to another track, trim (start/end/in/out/duration, or trim_start/trim_end amounts), enable/disable, rename, color label, link/unlink. move and trim also move/trim the linked clips (include_linked, default true) and are checked before editing (media range, locked tracks); link needs 2+ clips, unlink takes one clip of the group.",
     {
       action: z.enum(["move", "move_to_track", "trim", "set", "link", "unlink"]),
       sequence: seqArg,
@@ -506,6 +537,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       enabled: z.boolean().optional(),
       name: z.string().optional(),
       label: z.number().int().min(0).max(15).optional(),
+      include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true"),
     },
     ANN.write,
     (a) => {
@@ -529,8 +561,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "remove_clips",
     "Remove clips",
-    "Delete timeline clips (lift, or ripple to close the gap).",
-    { sequence: seqArg, clips: clipSelector, ripple: z.boolean().optional() },
+    "Delete timeline clips (lift, or ripple to close the gap). Linked clips are removed too unless include_linked: false.",
+    { sequence: seqArg, clips: clipSelector, ripple: z.boolean().optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.destructive,
     (a) => call("remove_clips", a),
   );
@@ -538,8 +570,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "razor",
     "Razor cut",
-    "Cut at one or many times, on all tracks or on given tracks. cuts counts the clips really split; times where no clip spans the cut (e.g. past the end of the sequence) are returned in skipped with a warning.",
-    { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional() },
+    "Cut at one or many times, on all tracks or on given tracks. With tracks, the linked clips on other tracks are cut too unless include_linked: false. cuts counts the clips really split; times where no clip spans the cut (e.g. past the end of the sequence) are returned in skipped with a warning.",
+    { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.write,
     (a) => call("razor", a),
   );
@@ -639,7 +671,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     "set_transform",
     "Transform clips",
     "Friendly Motion/Opacity setter: scale %, position in pixels, rotation, anchor, opacity %, crop %.",
-    { sequence: seqArg, clips: clipSelector, ...transform.shape, blend_mode: z.number().int().optional() },
+    { sequence: seqArg, clips: clipSelector, ...transform.shape, blend_mode: z.union([z.number().int(), z.string()]).optional().describe("Name (normal, multiply, screen, overlay, add, soft light, difference...; pt-BR names work) or Premiere index") },
     ANN.write,
     (a) => call("set_transform", a),
   );
@@ -733,8 +765,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "set_volume",
     "Clip volume",
-    "Set audio clip level in dB, or a dB envelope with keys [{t, db}] (ducking).",
-    { sequence: seqArg, clips: clipSelector, db: z.number().optional(), keys: z.array(z.object({ t: z.number(), db: z.number() })).optional() },
+    "Set audio clip level in dB, or a dB envelope with keys [{t, db}] (ducking). Selected video clips act on their linked audio.",
+    { sequence: seqArg, clips: clipSelector, db: z.number().optional(), keys: z.array(z.object({ t: z.number(), db: z.number() })).optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.write,
     (a) => call("set_volume", a),
   );
@@ -742,8 +774,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "fade_audio",
     "Audio fades",
-    "Fade audio clips in/out with volume keyframes (language-independent).",
-    { sequence: seqArg, clips: clipSelector, fade_in: z.number().optional(), fade_out: z.number().optional(), level_db: z.number().optional() },
+    "Fade audio clips in/out with volume keyframes (language-independent). Selected video clips act on their linked audio.",
+    { sequence: seqArg, clips: clipSelector, fade_in: z.number().optional(), fade_out: z.number().optional(), level_db: z.number().optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.write,
     (a) => call("fade_audio", a),
   );
@@ -816,7 +848,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "list_export_presets",
     "Export presets",
-    "Find .epr export presets installed with Premiere / Media Encoder (filter by regex, e.g. 'H.264|Match Source').",
+    "Find .epr export presets installed with Premiere / Media Encoder. filter is a regex matched against the preset name, its format (H.264, HEVC (H.265), Apple ProRes, QuickTime, Waveform Audio...) and its folder, e.g. 'H.264', 'ProRes 422', 'HEVC|H.264'. Each preset reports its format and folder.",
     { filter: z.string().optional() },
     ANN.read,
     async (a) => {
@@ -840,6 +872,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     },
     ANN.write,
     async (a) => {
+      // Fail fast on an unknown sequence (before scanning preset folders).
+      if (a.sequence) await call("get_sequence_settings", { sequence: a.sequence }, 15000);
       let preset = a.preset_path;
       if (!preset) {
         const list = media.findExportPresets("Match Source.*(High|Adaptive)|H\\.264");
@@ -914,7 +948,13 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         fs.writeFileSync(p, edl.text, "utf-8");
         return { path: p, generator: "premiere-mcp-plus (CMX3600 from timeline)", events: edl.events, bytes: fs.statSync(p).size };
       }
-      return call("export_aaf", { sequence: a.sequence, path: p }, 600000);
+      const r: any = await call("export_aaf", { sequence: a.sequence, path: p }, 300000);
+      // Premiere's "AAF Export Log" lists what AAF cannot carry; the bridge closes it.
+      const log = (r.dialogsClosed || []).map((d: any) => d.text).join(" ");
+      const ignored = [...log.matchAll(/Cannot export (video|audio) effect "([^"]+)"/g)].map((m) => `${m[1]}: ${m[2]}`);
+      if (ignored.length || log) r.warning = ignored.length ? `AAF ignored ${ignored.length} unsupported effect(s): ${[...new Set(ignored)].join(", ")}` : log.slice(0, 400);
+      if (ignored.length) r.ignoredEffects = [...new Set(ignored)];
+      return r;
     },
   );
 
@@ -1051,26 +1091,71 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "batch",
     "Batch operations",
-    "Run several host operations in a single Premiere round trip, in order (stops at first error unless continue_on_error). Op names are host handler names, e.g. place_clips, set_transform, add_keyframes, apply_effects, razor, add_markers, set_track.",
+    "Run several operations in order (stops at the first error unless continue_on_error). fn is the name of any tool of this server (place_clips, edit_clips, markers, playhead, set_clip_speed, apply_effects, set_transform, razor, manage_tracks...) with that tool's arguments in args, e.g. {fn:'markers', args:{action:'add', markers:[{time:5}]}}. Low-level host handler names also work (add_markers, set_playhead, set_speed, move_clips...); consecutive host ops run in one Premiere round trip. Image results are dropped; use export_frames on its own to see frames.",
     { ops: z.array(z.object({ fn: z.string(), args: z.record(z.string(), z.any()).optional() })).min(1), continue_on_error: z.boolean().optional() },
     ANN.write,
-    (a) => call("batch", a, 300000),
+    async (a) => {
+      const results: any[] = [];
+      let hostRun: { fn: string; args: any }[] = [];
+      let stop = false;
+      const flush = async () => {
+        if (!hostRun.length) return;
+        const r: any = await call("batch", { ops: hostRun, continue_on_error: a.continue_on_error }, 300000);
+        for (const x of r.results) results.push(x);
+        if (r.results.some((x: any) => !x.ok) && !a.continue_on_error) stop = true;
+        hostRun = [];
+      };
+      for (const op of a.ops) {
+        if (stop) break;
+        const t = op.fn === "batch" ? undefined : toolRegistry.get(op.fn);
+        if (!t) {
+          hostRun.push({ fn: op.fn, args: op.args || {} });
+          continue;
+        }
+        await flush();
+        if (stop) break;
+        const parsed = t.schema.safeParse(op.args || {});
+        if (!parsed.success) {
+          results.push({ ok: false, fn: op.fn, code: "BAD_ARGS", error: parsed.error.issues.map((i: any) => `${i.path.join(".")}: ${i.message}`).join("; ") });
+          if (!a.continue_on_error) break;
+          continue;
+        }
+        try {
+          let data: any = await t.handler(parsed.data);
+          if (data && Array.isArray(data.content)) {
+            // A tool that returned MCP content: keep its text part.
+            const txt = data.content.find((c: any) => c.type === "text")?.text;
+            if (data.isError) throw Object.assign(new Error(txt || "error"), { code: "TOOL_ERROR" });
+            try { data = JSON.parse(txt); } catch { data = txt; }
+          }
+          results.push({ ok: true, fn: op.fn, data });
+        } catch (e: any) {
+          results.push({ ok: false, fn: op.fn, error: String(e?.message || e), code: e?.code || "SERVER_ERROR" });
+          if (!a.continue_on_error) break;
+        }
+      }
+      if (!stop) await flush();
+      const failed = results.filter((r) => !r.ok).length;
+      const res: any = { results, failed };
+      if (failed) res.validOps = "tool names: " + [...toolRegistry.keys()].filter((k) => k !== "batch").join(", ");
+      return res;
+    },
   );
 
   tool(
     "undo",
     "Undo / redo",
-    "Undo whole tool calls with calls: N (recommended): one tool call can push several Premiere undo steps (set_clip_speed does), and DOM edits like trims and moves never reach Premiere's undo stack, so the server records both per call and rewinds them together. steps: N is Premiere's raw undo (Ctrl+Z) N times. history: true lists the recorded calls. Undoing by calls stops with UNDO_STACK_CHANGED if the project was edited by hand since.",
+    "Undo whole tool calls with calls: N (recommended): one tool call can push several Premiere undo steps (set_clip_speed does), and DOM edits like trims and moves never reach Premiere's undo stack, so the server records both per call and rewinds them together. redo: true with calls: N redoes calls undone that way (default 1). steps: N is Premiere's raw undo/redo (Ctrl+Z / Ctrl+Shift+Z) N times and clears the recorded calls. history: true lists the recorded calls. Undo/redo by calls stops with UNDO_STACK_CHANGED if the project was edited by hand since.",
     {
-      calls: z.number().int().min(1).max(50).optional().describe("Undo the last N tool calls"),
-      steps: z.number().int().min(1).max(50).optional().describe("Raw Premiere undo steps"),
-      redo: z.boolean().optional().describe("Redo raw steps"),
+      calls: z.number().int().min(1).max(50).optional().describe("Undo (or with redo: true, redo) the last N tool calls"),
+      steps: z.number().int().min(1).max(50).optional().describe("Raw Premiere undo/redo steps"),
+      redo: z.boolean().optional().describe("Redo instead of undo"),
       history: z.boolean().optional().describe("List the recorded calls instead of undoing"),
     },
     ANN.write,
     (a) => {
       if (a.history) return call("undo_history", {});
-      if (a.redo) return call("redo", a);
+      if (a.redo) return call("redo", a.steps === undefined ? { calls: a.calls ?? 1 } : { steps: a.steps });
       if (a.calls === undefined && a.steps === undefined) return call("undo", { calls: 1 });
       return call("undo", a);
     },

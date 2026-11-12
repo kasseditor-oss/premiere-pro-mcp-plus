@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AUTO_CLOSE, DialogWatcher, PROGRESS, type PremiereDialog } from "./dialogs.js";
 
 /** Error raised for anything the host reported or the bridge detected. */
 export class BridgeError extends Error {
@@ -39,11 +40,14 @@ export class PremiereBridge {
   private libVersion = "";
   private queue: Promise<unknown> = Promise.resolve();
   private seq = 0;
+  /** Watches for modal Premiere dialogs while a call is waiting (Windows). */
+  readonly dialogs = new DialogWatcher();
 
   constructor() {
     fs.mkdirSync(this.dir, { recursive: true });
     this.publishLibrary();
     this.cleanupStale();
+    this.dialogs.warm();
   }
 
   /** Copy the host library into the bridge directory, stamped with its content hash. */
@@ -119,7 +123,8 @@ export class PremiereBridge {
     fs.renameSync(staged, cmdFile);
 
     const timeoutMs = opts.timeoutMs ?? 90_000;
-    const text = await this.waitForFile(resFile, cmdFile, timeoutMs, fn);
+    const closed: PremiereDialog[] = [];
+    const text = await this.waitForFile(resFile, cmdFile, timeoutMs, fn, closed);
     try {
       fs.unlinkSync(resFile);
     } catch {
@@ -135,7 +140,15 @@ export class PremiereBridge {
       const e = parsed.error || {};
       throw new BridgeError(e.code || "HOST_ERROR", e.message || "Premiere reported an error", e.hint);
     }
-    return parsed.data as T;
+    const data = parsed.data;
+    // Informational dialogs (AAF Export Log...) were closed automatically: report them.
+    if (closed.length && data && typeof data === "object" && !Array.isArray(data)) (data as any).dialogsClosed = closed.map((d) => ({ title: d.title, text: d.text }));
+    return data as T;
+  }
+
+  /** Modal dialogs Premiere shows right now. */
+  openDialogs(): Promise<PremiereDialog[]> {
+    return this.dialogs.list();
   }
 
   private waitForHeartbeat(ms: number): Promise<boolean> {
@@ -150,15 +163,54 @@ export class PremiereBridge {
     });
   }
 
-  private waitForFile(resFile: string, cmdFile: string, timeoutMs: number, fn: string): Promise<string> {
+  private waitForFile(resFile: string, cmdFile: string, timeoutMs: number, fn: string, closed: PremiereDialog[] = []): Promise<string> {
     return new Promise((resolve, reject) => {
       let done = false;
       let watcher: fs.FSWatcher | null = null;
       const started = Date.now();
+      let checking = false;
+      // A dialog must stay open this long before it is reported (progress
+      // windows come and go; a question waits for a click).
+      const firstSeen = new Map<string, number>();
+      // A modal dialog blocks ExtendScript until someone clicks it. Check every
+      // 2 s: dismiss known informational logs, report anything else at once
+      // instead of waiting for the timeout.
+      const dialogPoll = setInterval(async () => {
+        if (done || checking || Date.now() - started < 1500) return;
+        checking = true;
+        try {
+          const list = await this.dialogs.list();
+          for (const d of list) {
+            if (done) break;
+            if (AUTO_CLOSE.some((re) => re.test(d.title))) {
+              await this.dialogs.close(d);
+              closed.push(d);
+            } else if (PROGRESS.some((re) => re.test(d.title))) {
+              continue;
+            } else {
+              const key = d.hwnd + "|" + d.title;
+              if (!firstSeen.has(key)) firstSeen.set(key, Date.now());
+              if (Date.now() - firstSeen.get(key)! < 6000) continue;
+              finish(
+                new BridgeError(
+                  "PREMIERE_DIALOG",
+                  `Premiere is showing a dialog "${d.title}"${d.text ? `: ${d.text.slice(0, 600)}` : ""}. '${fn}' will finish once it is closed.`,
+                  "Answer the dialog in Premiere, then check the result (e.g. get_timeline) before retrying.",
+                ),
+              );
+            }
+          }
+        } catch {
+          /* ignore */
+        } finally {
+          checking = false;
+        }
+      }, 2000);
       const finish = (err: Error | null, text?: string) => {
         if (done) return;
         done = true;
         clearInterval(poll);
+        clearInterval(dialogPoll);
         watcher?.close();
         if (err) reject(err);
         else resolve(text!);
