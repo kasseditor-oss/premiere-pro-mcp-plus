@@ -4,6 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AUTO_CLOSE, DialogWatcher, PROGRESS, type PremiereDialog } from "./dialogs.js";
+import { UxpConnector } from "./uxp.js";
+
+/** Per-function timing kept by the bridge (bridge_stats). */
+interface FnStat {
+  calls: number;
+  errors: number;
+  totalMs: number;
+  hostMs: number;
+  maxMs: number;
+  lastMs: number;
+}
 
 /** Error raised for anything the host reported or the bridge detected. */
 export class BridgeError extends Error {
@@ -42,9 +53,18 @@ export class PremiereBridge {
   private seq = 0;
   /** Watches for modal Premiere dialogs while a call is waiting (Windows). */
   readonly dialogs = new DialogWatcher();
+  /** UXP backend (WebSocket server the UXP plugin connects to). */
+  readonly uxp: UxpConnector;
+  readonly stats = new Map<string, FnStat>();
+  readonly recentErrors: { at: string; fn: string; code: string; message: string }[] = [];
+  readonly startedAt = Date.now();
+  private waiting = 0;
+  /** Open projects counted by the last host call (0 = unknown). */
+  openProjects = 0;
 
   constructor() {
     fs.mkdirSync(this.dir, { recursive: true });
+    this.uxp = new UxpConnector(this.dir);
     this.publishLibrary();
     this.cleanupStale();
     this.dialogs.warm();
@@ -94,13 +114,39 @@ export class PremiereBridge {
 
   /** Call a host-library function. Calls are queued so only one runs at a time. */
   call<T = any>(fn: string, args: Record<string, unknown> = {}, opts: CallOptions = {}): Promise<T> {
-    const run = () => this.callNow<T>(fn, args, opts);
+    this.waiting++;
+    const run = async () => {
+      this.waiting--;
+      const t0 = Date.now();
+      const st = this.stats.get(fn) || { calls: 0, errors: 0, totalMs: 0, hostMs: 0, maxMs: 0, lastMs: 0 };
+      this.stats.set(fn, st);
+      try {
+        const r = await this.callNow<T>(fn, args, opts, st);
+        return r;
+      } catch (e: any) {
+        st.errors++;
+        this.recentErrors.push({ at: new Date().toISOString(), fn, code: e?.code || "ERROR", message: String(e?.message || e).slice(0, 300) });
+        if (this.recentErrors.length > 20) this.recentErrors.shift();
+        throw e;
+      } finally {
+        const ms = Date.now() - t0;
+        st.calls++;
+        st.totalMs += ms;
+        st.lastMs = ms;
+        if (ms > st.maxMs) st.maxMs = ms;
+      }
+    };
     const p = this.queue.then(run, run);
     this.queue = p.catch(() => undefined);
     return p;
   }
 
-  private async callNow<T>(fn: string, args: Record<string, unknown>, opts: CallOptions): Promise<T> {
+  /** Calls queued behind the one running now. */
+  get queueDepth(): number {
+    return this.waiting;
+  }
+
+  private async callNow<T>(fn: string, args: Record<string, unknown>, opts: CallOptions, st?: FnStat): Promise<T> {
     const hb = this.heartbeat();
     if (!hb.alive) {
       // Give a just-launched Premiere a moment before failing.
@@ -136,6 +182,8 @@ export class PremiereBridge {
     } catch {
       throw new BridgeError("BAD_RESPONSE", `Unreadable response from Premiere: ${text.slice(0, 200)}`);
     }
+    if (st && typeof parsed.ms === "number") st.hostMs += parsed.ms;
+    if (typeof parsed.np === "number") this.openProjects = parsed.np;
     if (!parsed.ok) {
       const e = parsed.error || {};
       throw new BridgeError(e.code || "HOST_ERROR", e.message || "Premiere reported an error", e.hint);

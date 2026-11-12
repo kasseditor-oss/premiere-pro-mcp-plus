@@ -1,0 +1,60 @@
+{
+  "id": "com.premieremcpplus.uxp",
+  "name": "Premiere MCP Plus (UXP)",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "premierepro",
+    "minVersion": "25.6.0"
+  },
+  "requiredPermissions": {
+    "localFileSystem": "fullAccess",
+    "network": {
+      "domains": "all"
+    },
+    "allowCodeGenerationFromStrings": true
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "mcpPlusUxp",
+      "label": {
+        "default": "Premiere MCP Plus (UXP)"
+      },
+      "minimumSize": {
+        "width": 220,
+        "height": 120
+      },
+      "maximumSize": {
+        "width": 2000,
+        "height": 2000
+      },
+      "preferredDockedSize": {
+        "width": 300,
+        "height": 200
+      },
+      "preferredFloatingSize": {
+        "width": 320,
+        "height": 220
+      }
+    }
+  ],
+  "icons": [
+    {
+      "width": 48,
+      "height": 48,
+      "path": "icons/plugin.svg",
+      "scale": [
+        1,
+        2
+      ],
+      "theme": [
+        "all"
+      ],
+      "species": [
+        "pluginList"
+      ]
+    }
+  ]
+}

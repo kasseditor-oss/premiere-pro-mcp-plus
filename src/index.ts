@@ -89,6 +89,7 @@ function claudeDesktopConfigs(): string[] {
 
 function setup(replaceOriginal: boolean) {
   installCep();
+  try { installUxp(); } catch (e: any) { console.log("UXP plugin not installed: " + e.message); }
   const entry = { command: process.execPath, args: [path.join(packageRoot(), "dist", "index.js")] };
   for (const file of claudeDesktopConfigs()) {
     let cfg: any = {};
@@ -127,6 +128,44 @@ function setup(replaceOriginal: boolean) {
   console.log("\nDone. Restart Claude Desktop and Premiere Pro, then ask Claude: \"premiere_status\".");
 }
 
+/** UXP plugin folder and Premiere's plugin registry (sideloaded, needs UXP developer mode or a CC install). */
+const UXP_ID = "com.premieremcpplus.uxp";
+function uxpPaths() {
+  const base = process.platform === "win32" ? path.join(process.env.APPDATA || path.join(os.homedir(), "AppData/Roaming"), "Adobe/UXP") : path.join(os.homedir(), "Library/Application Support/Adobe/UXP");
+  const version = JSON.parse(fs.readFileSync(path.join(packageRoot(), "uxp", "manifest.json"), "utf-8")).version as string;
+  return { base, version, dest: path.join(base, "Plugins", "External", `${UXP_ID}_${version}`), registry: path.join(base, "PluginsInfo", "v1", "premierepro.json") };
+}
+function installUxp() {
+  const { base, version, dest, registry } = uxpPaths();
+  if (!fs.existsSync(base)) {
+    console.log("UXP is not set up on this machine (no Adobe/UXP folder); skipped the UXP plugin. CEP keeps working.");
+    return;
+  }
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(path.join(packageRoot(), "uxp"), dest, { recursive: true });
+  let reg: any = { plugins: [] };
+  if (fs.existsSync(registry)) {
+    const raw = fs.readFileSync(registry, "utf-8");
+    fs.writeFileSync(`${registry}.bak-mcpplus`, raw);
+    try { reg = JSON.parse(raw); } catch { reg = { plugins: [] }; }
+  } else fs.mkdirSync(path.dirname(registry), { recursive: true });
+  reg.plugins = (reg.plugins || []).filter((p: any) => p.pluginId !== UXP_ID);
+  reg.plugins.push({ hostMinVersion: "25.6.0", name: "Premiere MCP Plus (UXP)", path: "$localPlugins\\External\\" + UXP_ID + "_" + version, pluginId: UXP_ID, status: "enabled", type: "uxp", versionString: version });
+  fs.writeFileSync(registry, JSON.stringify(reg));
+  console.log(`Installed UXP plugin to ${dest}\nRestart Premiere Pro (25.6+). It connects to the MCP server on 127.0.0.1.`);
+}
+function uninstallUxp() {
+  const { dest, registry } = uxpPaths();
+  fs.rmSync(dest, { recursive: true, force: true });
+  try {
+    const reg = JSON.parse(fs.readFileSync(registry, "utf-8"));
+    reg.plugins = (reg.plugins || []).filter((p: any) => p.pluginId !== UXP_ID);
+    fs.writeFileSync(registry, JSON.stringify(reg));
+  } catch { /* none */ }
+  console.log("Removed " + dest);
+}
+
 function uninstallCep() {
   fs.rmSync(cepTargetDir(), { recursive: true, force: true });
   console.log("Removed " + cepTargetDir());
@@ -153,6 +192,8 @@ const argv = process.argv.slice(2);
 if (argv.includes("--setup")) setup(argv.includes("--replace-original"));
 else if (argv.includes("--install-cep")) installCep();
 else if (argv.includes("--uninstall-cep")) uninstallCep();
+else if (argv.includes("--install-uxp")) installUxp();
+else if (argv.includes("--uninstall-uxp")) uninstallUxp();
 else if (argv.includes("--doctor")) doctor().then(() => process.exit(0));
 else if (argv.includes("--version")) console.log(VERSION);
 else {

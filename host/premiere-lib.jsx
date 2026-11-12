@@ -763,6 +763,13 @@
     for (var k = 0; k < list.length; k++) names.push(list[k].name);
     fail("PROJECT_MISMATCH", target ? "Could not make '" + a.project + "' the active project." : "Project '" + a.project + "' is not open. Open: " + names.join(", "), "Open it with project_file action 'open', or omit project to use the active one.");
   };
+  // Project guard: fail unless the active project is the expected one.
+  H.check_project = function (a) {
+    var want = lower(String(a.path).replace(/\\/g, "/")), cur = "";
+    try { cur = lower(String(app.project.path).replace(/\\/g, "/")); } catch (e) {}
+    if (!cur || cur !== want) fail("PROJECT_MISMATCH", "The active project is " + (cur ? app.project.path : "none") + ", not " + a.path + ".", "Pass project to switch to it, or open it with project_file.");
+    return { project: app.project.name, path: app.project.path };
+  };
   H.close_other_projects = function () {
     var keep = app.project ? app.project.path : null, closed = [];
     for (var i = app.projects.numProjects - 1; i >= 0; i--) {
@@ -827,7 +834,7 @@
     try { app.project.save(); } catch (e) {}
     if (!act) act = focusProject(f.fsName);
     if (!act) fail("PROJECT_NOT_ACTIVE", "Created " + f.fsName + " but Premiere kept another project active.", "Close the other projects (project_file close_others) and retry.");
-    return { created: true, path: app.project.path, name: app.project.name };
+    return { created: true, path: f.fsName, name: decodeURI(f.name), active: lower(String(app.project.path)) === lower(f.fsName) };
   };
   H.close_project = function (a) {
     var p = requireProject(), path = String(p.path), name = p.name, err = null;
@@ -2915,7 +2922,7 @@
   var READ_ONLY = {
     ping: 1, get_state: 1, project_info: 1, list_project_items: 1, get_item_info: 1, list_sequences: 1, get_sequence_settings: 1,
     get_playhead: 1, get_timeline: 1, get_selection: 1, find_clips: 1, list_available_effects: 1, get_clip_effects: 1,
-    list_markers: 1, get_mogrt_params: 1, undo: 1, redo: 1, undo_history: 1, save_project: 1, scene_sources: 1, select_project: 1, close_other_projects: 1
+    list_markers: 1, get_mogrt_params: 1, check_project: 1, undo: 1, redo: 1, undo_history: 1, save_project: 1, scene_sources: 1, select_project: 1, close_other_projects: 1
   };
   // Handlers that change existing clips through DOM setters: snapshot their clips.
   var SNAPSHOT_FNS = { set_speed: 1, trim_clips: 1, move_clips: 1, set_clips: 1, close_gaps: 1 };
@@ -3057,7 +3064,7 @@
   // works on another sequence (export_frames with sequence: "Vert"...) never
   // leaves later calls without a sequence argument pointing at it.
   var SWITCHES_PROJECT = { new_project: 1, open_project: 1, close_project: 1, select_project: 1, close_other_projects: 1, batch: 1, eval_script: 1 };
-  var KEEPS_ACTIVE = { open_sequence: 1, create_sequence: 1, new_project: 1, open_project: 1, close_project: 1, delete_sequence: 1, save_project_as: 1, eval_script: 1, duplicate_sequence: 1, auto_reframe: 1, create_subsequence: 1, ping: 1, get_state: 1, select_project: 1, close_other_projects: 1 };
+  var KEEPS_ACTIVE = { open_sequence: 1, create_sequence: 1, new_project: 1, open_project: 1, close_project: 1, delete_sequence: 1, save_project_as: 1, eval_script: 1, duplicate_sequence: 1, auto_reframe: 1, create_subsequence: 1, ping: 1, get_state: 1, select_project: 1, close_other_projects: 1, check_project: 1 };
   function restoreActive(orig) {
     try {
       // Closing every sequence tab of a project (fast batches) can make
@@ -3095,7 +3102,8 @@
         try { data = H[fn](args); }
         finally { if (origSeq) restoreActive(origSeq); }
         if (journaled) try { journalCall(fn, args, before, snap); } catch (eJ) {}
-        return stringify({ ok: true, data: data, ms: new Date().getTime() - started });
+        var np = 0; try { np = app.projects.numProjects; } catch (eN) {}
+        return stringify({ ok: true, data: data, ms: new Date().getTime() - started, np: np });
       } catch (e) {
         // A failed call can still have pushed undo steps; record them so the
         // next undo({calls}) stays aligned with Premiere's stack.

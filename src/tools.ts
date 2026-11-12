@@ -9,6 +9,9 @@ import { findPreset, loadPresets } from "./presets.js";
 import { renderTitle } from "./titles.js";
 import * as media from "./media.js";
 import { buildEdl } from "./edl.js";
+import { JobManager, type JobContext } from "./jobs.js";
+import { CheckpointStore, diffTimelines } from "./checkpoint.js";
+import { activeProfiles, confirmationsOn, consumeToken, issueToken, packTools, profileFor } from "./policy.js";
 import sharp from "sharp";
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -92,16 +95,54 @@ function compact(v: unknown): string {
   return JSON.stringify(v, (_k, x) => (typeof x === "number" ? Math.round(x * 1000) / 1000 : x));
 }
 
-const projectArg = z.string().optional().describe("Open project to act on (name or .prproj path). Default: the active project.");
+const projectArg = z.string().optional().describe("Open project to act on (name or .prproj path). Default: active project.");
+const expectedArg = z.string().optional().describe("Guard: fail with PROJECT_MISMATCH unless this .prproj is the active project.");
 // Tools that do not touch a project (or manage projects themselves).
-const NO_PROJECT_ARG = new Set(["premiere_status", "project_file", "analyze_media", "list_export_presets", "list_effect_presets", "batch", "undo"]);
+const NO_PROJECT_ARG = new Set(["premiere_status", "bridge_stats", "jobs", "project_file", "analyze_media", "list_export_presets", "list_effect_presets", "batch", "undo", "recipes"]);
+
+/** Extra behaviour a tool opts into. */
+interface ToolOpts {
+  /** Supports async: true (runs as a background job). */
+  async?: boolean;
+  /** Supports checkpoint: true (clone the sequence first). */
+  checkpoint?: boolean;
+  /** Returns a preview when the call needs a confirmation token, or null. */
+  confirm?: (args: any) => Promise<unknown | null> | unknown | null;
+}
 
 export function registerTools(server: McpServer, bridge: PremiereBridge) {
 
   const scratch = path.join(os.tmpdir(), "premiere-mcp-plus", "frames");
+  const jobs = new JobManager();
+  const checkpoints = new CheckpointStore(bridge.dir);
+  const profiles = activeProfiles();
+  const pack = packTools();
 
   // Every tool, by name, for batch ops that use tool names (validated with the tool's own schema).
   const toolRegistry = new Map<string, { schema: z.ZodTypeAny; handler: (args: any) => Promise<unknown> }>();
+  const hidden: string[] = [];
+
+  /** Clone the sequence as "<name> [checkpoint hh:mm:ss]" and keep a snapshot of its timeline. */
+  async function makeCheckpoint(sequence?: string, label?: string, clone = true) {
+    const tl: any = await call("get_timeline", { sequence, include_effects: true, include_media: true, skip_empty: true });
+    const stamp = new Date().toTimeString().slice(0, 8);
+    const id = "cp_" + Date.now().toString(36);
+    let copy: any = null;
+    if (clone) copy = await call("duplicate_sequence", { sequence: tl.id, name: `${tl.name} [checkpoint ${stamp}${label ? " " + label : ""}]` }, 60000);
+    const cp = { id, createdAt: new Date().toISOString(), sequence: { id: tl.id, name: tl.name }, clone: copy ? { id: copy.id, name: copy.name } : undefined, label, timeline: tl };
+    checkpoints.save(cp);
+    return { checkpoint: id, sequence: cp.sequence, clone: cp.clone, clips: tl.tracks.reduce((n: number, t: any) => n + t.clips.length, 0) };
+  }
+
+  function statusOf(readOnly: boolean, out: any): string {
+    if (out && typeof out === "object" && typeof out.status === "string" && /^(verified|committed_unverified|failed|needs_confirmation|queued|ok)$/.test(out.status)) return out.status;
+    if (readOnly) return "ok";
+    if (out && typeof out === "object") {
+      if (out.verified === true) return "verified";
+      if (out.verified === false) return "failed";
+    }
+    return "committed_unverified";
+  }
 
   function tool<S extends z.ZodRawShape>(
     name: string,
@@ -109,20 +150,56 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     description: string,
     shape: S,
     annotations: (typeof ANN)[keyof typeof ANN],
-    handler: (args: z.infer<z.ZodObject<S>>) => Promise<unknown | ToolResult>,
+    handler: (args: z.infer<z.ZodObject<S>> & { [k: string]: any }, ctx?: JobContext) => Promise<unknown | ToolResult>,
+    opts: ToolOpts = {},
   ) {
-    // Every Premiere tool takes an optional project: the server makes that open
-    // project the active one first (or fails with PROJECT_MISMATCH), so a call
-    // never lands in another open project by accident.
-    const full = NO_PROJECT_ARG.has(name) ? shape : { ...shape, project: projectArg };
-    const run = async (args: any) => {
-      if (args?.project) {
+    // Authority: a tool outside the active permission profiles does not exist;
+    // a tool outside the active packs is hidden from the model (batch can still run it).
+    if (!profiles.has(profileFor(name))) return;
+    // Every Premiere tool takes an optional project / expected_project_path: the
+    // server makes that project active first (or fails with PROJECT_MISMATCH),
+    // so a call never lands in another open project by accident.
+    let full: z.ZodRawShape = NO_PROJECT_ARG.has(name) ? { ...shape } : { ...shape, project: projectArg, expected_project_path: expectedArg };
+    if (opts.async) full = { ...full, async: z.boolean().optional().describe("Run as a background job: returns job_id at once (see jobs)") };
+    if (opts.checkpoint) full = { ...full, checkpoint: z.boolean().optional().describe("Clone the sequence as a [checkpoint] first") };
+    if (opts.confirm) full = { ...full, confirm_token: z.string().optional().describe("Token from the preview call (single use)") };
+    const readOnly = annotations === ANN.read;
+    const run = async (args: any, inBatch = false) => {
+      args = { ...(args || {}) };
+      if (args.project) {
         await call("select_project", { project: args.project }, 30000);
         delete args.project;
       }
-      return handler(args);
+      if (args.expected_project_path) {
+        await call("check_project", { path: path.resolve(args.expected_project_path) }, 15000);
+        delete args.expected_project_path;
+      }
+      if (opts.confirm && confirmationsOn()) {
+        if (args.confirm_token) consumeToken(name, args);
+        else {
+          const preview = await opts.confirm(args);
+          if (preview) return { status: "needs_confirmation", preview, confirm_token: issueToken(name, args), hint: "Repeat the same call with confirm_token to execute." };
+        }
+      }
+      delete args.confirm_token;
+      let cp: any = null;
+      if (opts.checkpoint && args.checkpoint) cp = await makeCheckpoint(args.sequence);
+      delete args.checkpoint;
+      if (opts.async && args.async && !inBatch) {
+        delete args.async;
+        const id = jobs.start(name, (ctx) => handler(args, ctx) as Promise<unknown>);
+        return { status: "queued", job_id: id, checkpoint: cp || undefined, hint: "jobs action 'wait' or 'status' with this job_id." };
+      }
+      delete args.async;
+      const out: any = await handler(args);
+      if (cp && out && typeof out === "object" && !Array.isArray(out.content)) out.checkpoint = cp;
+      return out;
     };
-    toolRegistry.set(name, { schema: z.object(full), handler: run });
+    toolRegistry.set(name, { schema: z.object(full), handler: (a: any) => run(a, true) });
+    if (pack && !pack.has(name)) {
+      hidden.push(name);
+      return;
+    }
     server.registerTool(
       name,
       {
@@ -134,13 +211,32 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         _meta: { ui: { resourceUri: WIDGET_URI, visibility: ["model", "app"] }, "ui/resourceUri": WIDGET_URI },
       } as any,
       (async (args: any) => {
+        // Standard envelope: {ok, tool, status, data} or {ok:false, tool, status:"failed", error:{code, message, hint}}.
         try {
-          const out = await run(args);
-          if (out && typeof out === "object" && Array.isArray((out as ToolResult).content)) return out as ToolResult;
-          return { content: [{ type: "text", text: compact(out) }] };
+          const out: any = await run(args);
+          const warn = !NO_PROJECT_ARG.has(name) && bridge.openProjects > 1 ? `${bridge.openProjects} projects are open; this acted on the active one.` : undefined;
+          if (out && typeof out === "object" && Array.isArray((out as ToolResult).content)) {
+            const res = out as ToolResult;
+            const i = res.content.findIndex((c) => c.type === "text");
+            let data: any = i >= 0 ? (res.content[i] as any).text : null;
+            try {
+              data = JSON.parse(data);
+            } catch {
+              /* plain text */
+            }
+            const env = res.isError ? { ok: false, tool: name, status: "failed", error: data } : { ok: true, tool: name, status: statusOf(readOnly, data), data, warning: warn };
+            if (i >= 0) res.content[i] = { type: "text", text: compact(env) };
+            return res;
+          }
+          const status = statusOf(readOnly, out);
+          if (out && typeof out === "object" && !Array.isArray(out)) {
+            delete out.status;
+            delete out.verified;
+          }
+          return { content: [{ type: "text", text: compact({ ok: true, tool: name, status, data: out, warning: warn }) }] };
         } catch (e: any) {
-          const err = e instanceof BridgeError ? { error: e.message, code: e.code, hint: e.hint } : { error: String(e?.message || e), code: "SERVER_ERROR" };
-          return { isError: true, content: [{ type: "text", text: compact(err) }] };
+          const error = e instanceof BridgeError ? { code: e.code, message: e.message, hint: e.hint } : { code: e?.code || "SERVER_ERROR", message: String(e?.message || e) };
+          return { isError: true, content: [{ type: "text", text: compact({ ok: false, tool: name, status: "failed", error }) }] };
         }
       }) as any,
     );
@@ -153,6 +249,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     if (!hb.alive) return { connected: false, bridgeDir: bridge.dir, heartbeatAgeMs: hb.ageMs, fix: "Open Premiere Pro (extension auto-starts). If never installed: run `premiere-pro-mcp-plus --install-cep` and restart Premiere." };
     const [ping, dialogs] = await Promise.all([call("ping", {}, 15000) as Promise<any>, bridge.openDialogs()]);
     const res: any = { connected: true, ...ping, busy: hb.busy, commandsServed: hb.count };
+    res.backends = { cep: { connected: true, lib: ping.lib }, uxp: { state: bridge.uxp.state, port: bridge.uxp.port } };
     if (dialogs.length) res.dialogs = dialogs.map((d) => ({ title: d.title, text: d.text.slice(0, 300) }));
     if (ping.projects && ping.projects.length > 1) res.warning = `${ping.projects.length} projects are open; tools act on the active one (${ping.project?.name}). Close the others or pass project to choose.`;
     return res;
@@ -309,6 +406,14 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       if ((a.action === "new" || a.action === "open") && a.close_others) r.closedOthers = ((await call("close_other_projects", {})) as any).closed;
       return r;
     },
+    {
+      confirm: async (a: any) => {
+        if (a.action !== "close_others" && !a.close_others) return null;
+        const st: any = await call("ping", {});
+        const others = (st.projects || []).filter((p: any) => !p.active).map((p: any) => p.path);
+        return others.length ? { action: "close other projects without saving", projects: others } : null;
+      },
+    },
   );
 
   // ======================================================== sequences
@@ -358,6 +463,13 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     (a) => {
       const map: Record<string, string> = { rename: "rename_sequence", duplicate: "duplicate_sequence", delete: "delete_sequence", settings: "set_sequence_settings", get_settings: "get_sequence_settings", range: "set_sequence_range" };
       return call(map[a.action], a);
+    },
+    {
+      confirm: async (a: any) => {
+        if (a.action !== "delete") return null;
+        const st: any = await call("get_sequence_settings", { sequence: a.sequence });
+        return { action: "delete sequence", sequence: { id: st.id, name: st.name, duration: st.duration } };
+      },
     },
   );
 
@@ -418,6 +530,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       for (const c of cuts) made.push(await call("razor", { sequence: a.sequence, times: [c.time], tracks: c.tracks }));
       return { ok: true, action: act, method: "ffmpeg", threshold, cutTimes: cuts.map((c) => c.time), cuts: made.reduce((n, r) => n + (r.cuts || 0), 0), skipped: skipped.length ? skipped : undefined, note: "Premiere's Scene Edit Detection produced nothing; cuts were detected with FFmpeg and razored on the clips' tracks." };
     },
+    { async: true },
   );
 
   // ======================================================== timeline
@@ -505,6 +618,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     },
     ANN.write,
     (a) => call("place_clips", a, 120000 + a.clips.length * 3000),
+    { checkpoint: true },
   );
 
   tool(
@@ -556,6 +670,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
           return call("link_clips", { ...a, unlink: true });
       }
     },
+    { checkpoint: true },
   );
 
   tool(
@@ -565,6 +680,16 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     { sequence: seqArg, clips: clipSelector, ripple: z.boolean().optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.destructive,
     (a) => call("remove_clips", a),
+    {
+      checkpoint: true,
+      // Ripple-removing many clips shifts the whole timeline: preview first.
+      confirm: async (a: any) => {
+        if (!a.ripple) return null;
+        const found: any = await call("find_clips", { sequence: a.sequence, clips: a.clips });
+        const n = (found.clips || found).length;
+        return n >= 10 ? { action: "ripple remove", clips: n, note: "Every clip after each removed one moves left." } : null;
+      },
+    },
   );
 
   tool(
@@ -574,6 +699,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     { sequence: seqArg, times: z.array(z.number()).min(1), tracks: z.array(z.string()).optional(), include_linked: z.boolean().optional().describe("Also edit the linked clips (audio of a video clip and vice versa). Default true") },
     ANN.write,
     (a) => call("razor", a),
+    { checkpoint: true },
   );
 
   tool(
@@ -591,6 +717,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     },
     ANN.write,
     (a) => call("set_speed", a),
+    { checkpoint: true },
   );
 
   tool(
@@ -600,6 +727,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     { sequence: seqArg, tracks: z.array(z.string()), from: z.number().optional() },
     ANN.write,
     (a) => call("close_gaps", a),
+    { checkpoint: true },
   );
 
   tool(
@@ -920,8 +1048,9 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         delete res.tempSequence;
       }
       if (!check.valid) throw new Error(`Premiere wrote an incomplete file (${check.reason}). Keep the Premiere window visible and retry, or use use_media_encoder: true.`);
-      return { ...res, bytes: fs.statSync(actual).size, duration: check.duration };
+      return { ...res, status: "verified", bytes: fs.statSync(actual).size, duration: check.duration };
     },
+    { async: true },
   );
 
   tool(
@@ -1076,6 +1205,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         }
       }
     },
+    { async: true },
   );
 
   // ======================================================== power tools
@@ -1109,6 +1239,13 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
         if (stop) break;
         const t = op.fn === "batch" ? undefined : toolRegistry.get(op.fn);
         if (!t) {
+          // Raw host handler names: need the edit profile; eval_script needs unsafe-script.
+          const need = op.fn === "eval_script" ? "unsafe-script" : "edit";
+          if (!profiles.has(need as any)) {
+            results.push({ ok: false, fn: op.fn, code: "PERMISSION_DENIED", error: `'${op.fn}' is not available with the active permission profiles (${[...profiles].join(", ")}).` });
+            if (!a.continue_on_error) break;
+            continue;
+          }
           hostRun.push({ fn: op.fn, args: op.args || {} });
           continue;
         }
@@ -1158,6 +1295,98 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       if (a.redo) return call("redo", a.steps === undefined ? { calls: a.calls ?? 1 } : { steps: a.steps });
       if (a.calls === undefined && a.steps === undefined) return call("undo", { calls: 1 });
       return call("undo", a);
+    },
+  );
+
+  // ======================================================== architecture (jobs, checkpoints, stats)
+  tool(
+    "jobs",
+    "Background jobs",
+    "Follow tools started with async: true. status/wait return state (running, done, failed, cancelled), progress 0-1, ETA and the result or error; wait blocks up to timeout_s (default 60). list shows recent jobs; cancel stops loops at the next step.",
+    { action: z.enum(["status", "wait", "list", "cancel"]), job_id: z.string().optional(), timeout_s: z.number().optional() },
+    ANN.read,
+    async (a) => {
+      if (a.action === "list") return { jobs: jobs.list() };
+      if (!a.job_id) throw new BridgeError("BAD_ARGS", "job_id is required.");
+      if (a.action === "status") return jobs.status(a.job_id);
+      if (a.action === "cancel") return jobs.cancel(a.job_id);
+      return jobs.wait(a.job_id, Math.min(600, a.timeout_s ?? 60) * 1000);
+    },
+  );
+
+  tool(
+    "checkpoint",
+    "Checkpoints and diff",
+    "create: clone the sequence as '<name> [checkpoint hh:mm:ss]' and keep a snapshot of its clips (clone: false keeps only the snapshot). list: saved checkpoints. diff: compare two sequences, or a checkpoint (from) with the sequence now or another checkpoint (to): clips added, removed, moved, trimmed, changed (speed, effects, enabled). restore: duplicate the checkpoint's clone as '<name> (restored)' and open it.",
+    {
+      action: z.enum(["create", "list", "diff", "restore"]),
+      sequence: seqArg,
+      label: z.string().optional(),
+      clone: z.boolean().optional().describe("create: also clone the sequence (default true)"),
+      from: z.string().optional().describe("diff: checkpoint id or sequence (default: the latest checkpoint of the sequence)"),
+      to: z.string().optional().describe("diff: checkpoint id or sequence (default: the sequence now)"),
+      checkpoint_id: z.string().optional().describe("restore: checkpoint id"),
+    },
+    ANN.write,
+    async (a) => {
+      if (a.action === "create") return { status: "verified", ...(await makeCheckpoint(a.sequence, a.label, a.clone !== false)) };
+      if (a.action === "list") return { checkpoints: checkpoints.list() };
+      if (a.action === "restore") {
+        const cp = checkpoints.get(a.checkpoint_id || "");
+        if (!cp) throw new BridgeError("CHECKPOINT_NOT_FOUND", `No checkpoint ${a.checkpoint_id}.`, "checkpoint action 'list'.");
+        if (!cp.clone) throw new BridgeError("CHECKPOINT_HAS_NO_CLONE", "This checkpoint kept only a snapshot (clone: false); there is no sequence to restore.");
+        const copy: any = await call("duplicate_sequence", { sequence: cp.clone.id, name: `${cp.sequence.name} (restored)`, activate: true }, 60000);
+        return { status: "verified", restored: copy, from: cp.clone };
+      }
+      // diff
+      const load = async (ref: string | undefined, fallbackSeq?: string) => {
+        if (ref && /^cp_/.test(ref)) {
+          const cp = checkpoints.get(ref);
+          if (!cp) throw new BridgeError("CHECKPOINT_NOT_FOUND", `No checkpoint ${ref}.`);
+          return { label: `${ref} (${cp.sequence.name} @ ${cp.createdAt})`, tl: cp.timeline };
+        }
+        const tl: any = await call("get_timeline", { sequence: ref || fallbackSeq, include_effects: true, include_media: true, skip_empty: true });
+        return { label: `${tl.name} (now)`, tl };
+      };
+      let fromRef = a.from;
+      if (!fromRef) {
+        const seq: any = await call("get_sequence_settings", { sequence: a.sequence });
+        const latest = checkpoints.list().find((c: any) => c.sequence.id === seq.id || c.sequence.name === seq.name);
+        if (!latest) throw new BridgeError("CHECKPOINT_NOT_FOUND", "No checkpoint of this sequence yet.", "Pass from (a checkpoint id or a sequence), or create one first.");
+        fromRef = latest.id;
+      }
+      const x = await load(fromRef);
+      const y = await load(a.to, a.sequence);
+      return { from: x.label, to: y.label, ...diffTimelines(x.tl, y.tl) };
+    },
+  );
+
+  tool(
+    "bridge_stats",
+    "Bridge statistics",
+    "Local telemetry: calls, errors, average/max time per host function (round trip and inside Premiere), queue depth, recent errors, backends.",
+    { reset: z.boolean().optional() },
+    ANN.read,
+    async (a) => {
+      const fns = [...bridge.stats.entries()]
+        .map(([fn, s]) => ({ fn, calls: s.calls, errors: s.errors, avgMs: Math.round(s.totalMs / Math.max(1, s.calls)), avgHostMs: Math.round(s.hostMs / Math.max(1, s.calls)), maxMs: s.maxMs, lastMs: s.lastMs }))
+        .sort((x, y) => y.calls * y.avgMs - x.calls * x.avgMs);
+      const out = {
+        uptimeS: Math.round((Date.now() - bridge.startedAt) / 1000),
+        queueDepth: bridge.queueDepth,
+        busy: bridge.heartbeat().busy,
+        functions: fns,
+        recentErrors: bridge.recentErrors.slice(-10),
+        backends: { cep: bridge.heartbeat().alive ? "connected" : "not connected", uxp: bridge.uxp.state },
+        jobs: jobs.list().filter((j) => j.state === "running").length,
+        profiles: [...profiles],
+        hiddenByPack: hidden.length ? hidden : undefined,
+      };
+      if (a.reset) {
+        bridge.stats.clear();
+        bridge.recentErrors.length = 0;
+      }
+      return out;
     },
   );
 }
