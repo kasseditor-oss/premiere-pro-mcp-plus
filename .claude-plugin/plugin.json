@@ -1,6 +1,6 @@
 {
   "name": "premiere-pro-mcp-plus",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "description": "Control Adobe Premiere Pro from Claude Code: batch timeline building, effects, color, audio mix, captions, automatic edits and verified delivery.",
   "author": {
     "name": "kasseditor-oss"

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.5.2
+
+- Correção do 2.5.1: o 2024 e o 2025 continuam funcionando pelo CEP (UXP a partir do 25.6). A prioridade de desenvolvimento e testes é o 2026 e o 2027; `premiere_status` mostra `versionNote` abaixo da 26.
+
 ## 2.5.1
 
 - Alvo: Premiere Pro 2026 (26.x) em diante, incluindo o 2027. Versões anteriores deixam de ser suportadas; `premiere_status` avisa (`versionWarning`). UXP com `minVersion` 26.0.

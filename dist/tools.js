@@ -236,7 +236,7 @@ export function registerTools(server, bridge) {
         if (dialogs.length)
             res.dialogs = dialogs.map((d) => ({ title: d.title, text: d.text.slice(0, 300) }));
         if (Number(String(ping.premiere).split(".")[0]) < 26)
-            res.versionWarning = `Premiere ${ping.premiere} is older than 2026 (26.x): not supported; some tools may fail.`;
+            res.versionNote = `Premiere ${ping.premiere}: works through CEP; live tests and new features target 2026+.`;
         if (ping.projects && ping.projects.length > 1)
             res.warning = `${ping.projects.length} projects are open; tools act on the active one (${ping.project?.name}). Close the others or pass project to choose.`;
         return res;

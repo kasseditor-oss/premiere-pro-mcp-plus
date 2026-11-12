@@ -7,7 +7,7 @@ config file is backed up next to itself as `*.bak-<timestamp>` first).
 
 ## Requirements
 
-- Windows 10/11 (macOS untested) with **Adobe Premiere Pro 2026 (26.x) or newer**. Older versions are not supported.
+- Windows 10/11 (macOS untested) with **Adobe Premiere Pro 2024 or newer**. Priority and live tests: 2026 (26.x) and 2027; 2024/2025 work through CEP but are not the focus.
 - **Node.js 20+** (`node -v`). If missing, ask the user to install it from nodejs.org.
 - Optional: **FFmpeg** on PATH (analysis, delivery checks, automatic edits) and
   **faster-whisper** (`pip install faster-whisper`, Python 3.9+) for local transcription.

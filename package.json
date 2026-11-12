@@ -1,6 +1,6 @@
 {
   "name": "premiere-pro-mcp-plus",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "description": "Improved MCP server for Adobe Premiere Pro: fast event-driven CEP bridge, JSON-RPC host library, batch timeline building, effect presets, title images, frame previews and an inline MCP App activity widget.",
   "type": "module",
   "main": "dist/index.js",

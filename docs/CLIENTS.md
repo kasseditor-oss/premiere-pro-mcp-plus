@@ -2,7 +2,7 @@
 
 O servidor fala MCP por stdio. Qualquer cliente que rode um comando local funciona.
 Antes, instale o lado do Premiere uma vez: `npm install && npm run setup`
-(ou `node dist/index.js --install-cep`, mais `--install-uxp`). Premiere Pro 2026 (26.x) ou mais novo.
+(ou `node dist/index.js --install-cep`, mais `--install-uxp` no Premiere 25.6+). Prioridade: Premiere 2026 e 2027; 2024/2025 funcionam pelo CEP.
 
 Nos exemplos, troque `C:/caminho/premiere-pro-mcp-plus` pela pasta do repositório.
 

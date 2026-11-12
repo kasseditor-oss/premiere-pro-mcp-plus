@@ -5,7 +5,7 @@ Monta timelines inteiras numa chamada, aplica efeitos, cor e mixagem de áudio, 
 legendas e edições automáticas (jump cut, vícios de fala, multicam, Shorts) e entrega
 arquivos conferidos com FFmpeg. Toda escrita relê o Premiere e diz se foi verificada.
 
-Feito para o **Premiere Pro 2026 (26.x) em diante**, incluindo o 2027. Ponte dupla: **CEP/ExtendScript** e **UXP**,
+Prioridade: **Premiere Pro 2026 (26.x) e 2027**; o 2024 e o 2025 continuam funcionando pelo CEP. Ponte dupla: **CEP/ExtendScript** e **UXP** (25.6+),
 escolhida por ação conforme o que cada uma suporta.
 
 ## Instalar
@@ -139,9 +139,10 @@ Os tempos sobem quando há outros projetos ou abas de sequência abertos usando 
 | | Windows 11 | macOS |
 |---|---|---|
 | Premiere Pro 2026 (26.5.2) | testado ao vivo (todos os e2e) | não testado |
-| UXP (26.x) | plugin instalado; carregamento confirmado; rotas não testadas ao vivo | não testado |
+| Premiere Pro 2024 / 2025 | deve funcionar pelo CEP; não é prioridade, sem teste ao vivo | não testado |
+| UXP (25.6+) | plugin instalado; carregamento confirmado; rotas não testadas ao vivo | não testado |
 
-Suporte só do **2026 em diante**: versões anteriores não são alvo. O 2027 entra nos testes quando for lançado; o servidor avisa em `premiere_status` se a versão for anterior à 26.
+Prioridade de desenvolvimento e testes: 2026 e 2027 (testado assim que for lançado). O 2024 e o 2025 seguem funcionando pelo CEP, sem recurso novo pensado para eles; o que depender de API mais nova devolve erro claro.
 
 ## Testes
 

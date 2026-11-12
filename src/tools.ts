@@ -257,7 +257,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
     res.backends = { cep: { connected: true, lib: ping.lib }, uxp: { state: bridge.uxp.state, port: bridge.uxp.port, version: probe?.version, capabilities: probe?.capabilities } };
     res.routes = Object.fromEntries(Object.entries(UXP_ROUTES).map(([k, cap]) => [k, probe?.capabilities?.[cap] ? "uxp" : "cep"]));
     if (dialogs.length) res.dialogs = dialogs.map((d) => ({ title: d.title, text: d.text.slice(0, 300) }));
-    if (Number(String(ping.premiere).split(".")[0]) < 26) res.versionWarning = `Premiere ${ping.premiere} is older than 2026 (26.x): not supported; some tools may fail.`;
+    if (Number(String(ping.premiere).split(".")[0]) < 26) res.versionNote = `Premiere ${ping.premiere}: works through CEP; live tests and new features target 2026+.`;
     if (ping.projects && ping.projects.length > 1) res.warning = `${ping.projects.length} projects are open; tools act on the active one (${ping.project?.name}). Close the others or pass project to choose.`;
     return res;
   });
