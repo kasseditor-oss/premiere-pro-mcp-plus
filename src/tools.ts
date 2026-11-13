@@ -15,6 +15,7 @@ import { JobManager, type JobContext } from "./jobs.js";
 import { CheckpointStore, diffTimelines } from "./checkpoint.js";
 import { activeProfiles, confirmationsOn, consumeToken, issueToken, packTools, profileFor } from "./policy.js";
 import sharp from "sharp";
+const r3t = (n: number) => Math.round(n * 1000) / 1000;
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 interface ToolResult {
@@ -102,7 +103,7 @@ interface ToolOpts {
 export function registerTools(server: McpServer, bridge: PremiereBridge) {
 
   const scratch = path.join(os.tmpdir(), "premiere-mcp-plus", "frames");
-  const jobs = new JobManager();
+  const jobs = new JobManager(path.join(bridge.dir, "jobs"));
   const checkpoints = new CheckpointStore(bridge.dir);
   const profiles = activeProfiles();
   const pack = packTools();
@@ -170,7 +171,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
           if (preview) return { status: "needs_confirmation", preview, confirm_token: issueToken(name, args), hint: "Repeat the same call with confirm_token to execute." };
         }
       }
-      delete args.confirm_token;
+      if (opts.confirm) delete args.confirm_token;
       let cp: any = null;
       if (opts.checkpoint && args.checkpoint) cp = await makeCheckpoint(args.sequence);
       delete args.checkpoint;
@@ -223,7 +224,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
           }
           return { content: [{ type: "text", text: compact({ ok: true, tool: name, status, data: out, warning: warn }) }] };
         } catch (e: any) {
-          const error = e instanceof BridgeError ? { code: e.code, message: e.message, hint: e.hint } : { code: e?.code || "SERVER_ERROR", message: String(e?.message || e) };
+          const error = e instanceof BridgeError ? { code: e.code, message: e.message, hint: e.hint } : { code: e?.code || "SERVER_ERROR", message: String(e?.message || e), hint: e?.hint };
           return { isError: true, content: [{ type: "text", text: compact({ ok: false, tool: name, status: "failed", error }) }] };
         }
       }) as any,
@@ -333,7 +334,11 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       }
       const imported = results.flatMap((r) => r.imported);
       const missing = results.flatMap((r) => r.missing);
-      return { imported, missing, count: imported.length };
+      // Premiere's "File Import Failure" dialog (closed automatically): files it refused, e.g. unsupported codecs.
+      const refused = results.flatMap((r) => (r.dialogsClosed || []).filter((d: any) => /import/i.test(d.title)));
+      const warns = imported.filter((i: any) => i.warning).map((i: any) => `${i.name}: ${i.warning}`);
+      if (refused.length) warns.unshift(`Premiere refused some files (${refused.map((d: any) => [d.title, d.text].filter(Boolean).join(": ")).join("; ")}). Unsupported codec? Transcode to H.264 first.`);
+      return { imported, missing, count: imported.length, warning: warns.length ? warns.join(" ") : undefined };
     },
   );
 
@@ -679,7 +684,8 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       sequence: seqArg,
       clips: clipSelector.optional(),
       edge: z.enum(["start", "end"]).optional(),
-      at: z.number().optional(),
+      at: z.number().optional().describe("Sequence time (s)"),
+      offset: z.number().optional().describe("freeze_frame: seconds into the clip (instead of at)"),
       gap: z.number().optional(),
       ripple: z.boolean().optional(),
       tracks: z.array(z.string()).optional(),
@@ -723,7 +729,11 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
           const src: any = await call("clip_media", { sequence: a.sequence, clips: a.clips });
           const c = src.clips.find((x: any) => x.video);
           if (!c) throw new BridgeError("BAD_ARGS", "freeze_frame needs a video clip.");
-          const at = a.at ?? c.start;
+          // at: sequence time; offset: seconds into the clip. Either must fall inside the clip,
+          // or the still would land on (and overwrite) another clip.
+          const at = a.offset !== undefined ? r3t(c.start + a.offset) : (a.at ?? c.start);
+          if (at < c.start - 0.001 || at > c.end - 0.01)
+            throw new BridgeError("BAD_ARGS", `freeze_frame at ${at}s is outside the clip (${r3t(c.start)}-${r3t(c.end)}s). 'at' is sequence time.`, `Pass at between ${r3t(c.start)} and ${r3t(c.end)}, or offset (seconds into the clip).`);
           const pngPreset = media.findExportPresets("PNG Sequence \\(Match Source\\)").find((p) => !/Alpha/i.test(p.name) && /Premiere/i.test(p.path))?.path;
           const fr: any = await call("export_frame", { sequence: a.sequence, times: [at], folder: path.join(bridge.dir, "freeze"), png_preset: pngPreset }, 60000);
           const still = fr.frames?.[0]?.path;
@@ -1165,11 +1175,13 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "list_export_presets",
     "Export presets",
-    "Find .epr export presets installed with Premiere / Media Encoder. filter is a regex matched against the preset name, its format (H.264, HEVC (H.265), Apple ProRes, QuickTime, Waveform Audio...) and its folder, e.g. 'H.264', 'ProRes 422', 'HEVC|H.264'. Each preset reports its format and folder.",
+    "Find .epr export presets installed with Premiere / Media Encoder. filter is a regex matched against the preset name, its format (H.264, HEVC (H.265), Apple ProRes, QuickTime, Waveform Audio...) and its folder, e.g. 'H.264', 'ProRes 422', 'HEVC|H.264'. Each preset reports its format, folder and container (the file type it writes: mp4, mov, wav...).",
     { filter: z.string().optional() },
     ANN.read,
     async (a) => {
       const list = media.findExportPresets(a.filter);
+      // H.264 / HEVC searches: presets that write .mp4 first (some H.264 presets write QuickTime .mov).
+      if (a.filter && /264|265|hevc/i.test(a.filter)) list.sort((x, y) => Number(y.container === "mp4") - Number(x.container === "mp4"));
       return { count: list.length, presets: list.slice(0, 80) };
     },
   );
@@ -1323,7 +1335,7 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
       if (a.template === "counter") Object.assign(spec, { align: "center", y: a.y ?? H * 0.6, lines: L.map((l: any, i: number) => ({ size: i ? H * 0.06 : H * 0.3, stroke_color: "#000000", stroke_width: H * 0.008, ...l })) });
       if (a.template === "chapter_tag") Object.assign(spec, { align: "left", x: a.x ?? W * 0.04, y: a.y ?? H * 0.1, lines: L.map((l: any) => ({ size: H * 0.045, letter_spacing: 2, ...l })), shadow: a.shadow ?? { dx: 3, dy: 3, blur: 3 } });
       const r = renderTitle(spec as any);
-      const out: any = { title: r };
+      const out: any = { title: r, warning: r.warning };
       if (a.place) {
         const imp: any = await call("import_files", { paths: [r.path], bin: a.place.bin || "_MCP Plus/Titles" });
         const id = imp.imported[0]?.id;
@@ -1457,10 +1469,19 @@ export function registerTools(server: McpServer, bridge: PremiereBridge) {
   tool(
     "run_extendscript",
     "Run ExtendScript",
-    "Escape hatch: run ExtendScript in Premiere. The code is a function body; use `return` to send back a JSON-serializable value. `H` exposes every host handler and `helpers` has getSequence/selectClips/resolveItem/tsec. The language is ES3: no let/const, arrow functions, template strings, Array.map/forEach or JSON object. Reserved words cannot be literal keys: `{in: 1}` fails with \"Illegal use of reserved word 'in'\"; write `o[\"in\"] = 1` (same for class, default, new...).",
-    { code: z.string() },
+    "Escape hatch: run ExtendScript in Premiere (or UXP JavaScript with backend:'uxp'). The code is a function body; use `return` to send back a JSON-serializable value. `H` exposes every host handler and `helpers` has getSequence/selectClips/resolveItem/tsec. The language is ES3: no let/const, arrow functions, template strings, Array.map/forEach or JSON object. Reserved words cannot be literal keys: `{in: 1}` fails with \"Illegal use of reserved word 'in'\"; write `o[\"in\"] = 1` (same for class, default, new...).",
+    {
+      code: z.string(),
+      backend: z.enum(["cep", "uxp"]).optional().describe("uxp: run modern JavaScript in the UXP plugin (async body, `ppro` and `uxp` in scope). Default cep (ExtendScript)."),
+    },
     ANN.destructive,
-    (a) => call("eval_script", a, 120000),
+    async (a: any) => {
+      if (a.backend === "uxp") {
+        if (!bridge.uxp.connected) throw new BridgeError("UXP_NOT_CONNECTED", "The UXP plugin is not connected.", "Install it (--install-uxp) and restart Premiere; premiere_status shows backends.uxp.");
+        return uxpCall("js", { code: a.code });
+      }
+      return call("eval_script", { code: a.code }, 120000);
+    },
   );
 
   tool(

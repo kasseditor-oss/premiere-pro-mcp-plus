@@ -40,11 +40,106 @@ function familyFromFontFile(file) {
     }
     return null;
 }
+/** Family names (nameID 1) of a font file, reading only the table directory and the name table. */
+function familiesOf(file) {
+    let fd = -1;
+    try {
+        fd = fs.openSync(file, "r");
+        const read = (pos, len) => {
+            const b = Buffer.alloc(len);
+            fs.readSync(fd, b, 0, len, pos);
+            return b;
+        };
+        const head = read(0, 12);
+        const starts = head.toString("ascii", 0, 4) === "ttcf" ? [read(12, 4).readUInt32BE(0)] : [0];
+        const out = [];
+        for (const base of starts) {
+            const n = read(base + 4, 2).readUInt16BE(0);
+            const dir = read(base + 12, n * 16);
+            for (let i = 0; i < n; i++) {
+                if (dir.toString("ascii", i * 16, i * 16 + 4) !== "name")
+                    continue;
+                const tbl = read(dir.readUInt32BE(i * 16 + 8), dir.readUInt32BE(i * 16 + 12));
+                const count = tbl.readUInt16BE(2);
+                const strOff = tbl.readUInt16BE(4);
+                for (let j = 0; j < count; j++) {
+                    const r = 6 + j * 12;
+                    const id = tbl.readUInt16BE(r + 6);
+                    if (id !== 1 && id !== 16)
+                        continue;
+                    const platform = tbl.readUInt16BE(r);
+                    const raw = tbl.subarray(strOff + tbl.readUInt16BE(r + 10), strOff + tbl.readUInt16BE(r + 10) + tbl.readUInt16BE(r + 8));
+                    let s = "";
+                    if (platform === 3 || platform === 0)
+                        for (let k = 0; k + 1 < raw.length; k += 2)
+                            s += String.fromCharCode(raw.readUInt16BE(k));
+                    else
+                        s = raw.toString("latin1");
+                    if (s)
+                        out.push(s);
+                }
+            }
+        }
+        return out;
+    }
+    catch {
+        return [];
+    }
+    finally {
+        if (fd >= 0)
+            fs.closeSync(fd);
+    }
+}
+let systemFamilyCache = null;
+const familyFiles = new Map();
+/** Lowercased family names of the installed fonts (scanned once). */
+export function systemFamilies() {
+    if (systemFamilyCache)
+        return systemFamilyCache;
+    const dirs = process.platform === "win32"
+        ? [path.join(process.env.WINDIR || "C:\\Windows", "Fonts"), path.join(process.env.LOCALAPPDATA || "", "Microsoft", "Windows", "Fonts")]
+        : ["/Library/Fonts", "/System/Library/Fonts", path.join(process.env.HOME || "", "Library", "Fonts"), "/usr/share/fonts", path.join(process.env.HOME || "", ".fonts")];
+    const set = new Set();
+    for (const d of dirs) {
+        let names = [];
+        try {
+            names = fs.readdirSync(d);
+        }
+        catch {
+            continue;
+        }
+        for (const n of names)
+            if (/\.(ttf|otf|ttc)$/i.test(n))
+                for (const f of familiesOf(path.join(d, n))) {
+                    const k = f.toLowerCase();
+                    set.add(k);
+                    const list = familyFiles.get(k) || [];
+                    if (!list.includes(path.join(d, n)))
+                        list.push(path.join(d, n));
+                    familyFiles.set(k, list);
+                }
+    }
+    systemFamilyCache = set;
+    return set;
+}
+/**
+ * resvg font options. Loading every system font costs ~0.4 s per render, so when
+ * the family is installed only its files (plus Arial as fallback) are loaded.
+ */
+export function fontOptions(family, extraFiles = []) {
+    systemFamilies();
+    const own = familyFiles.get(family.toLowerCase());
+    if (!own?.length)
+        return { fontFiles: extraFiles, loadSystemFonts: true, defaultFontFamily: family };
+    const files = [...extraFiles, ...own, ...(familyFiles.get("arial") || []), ...(familyFiles.get("segoe ui emoji") || [])];
+    return { fontFiles: [...new Set(files)], loadSystemFonts: false, defaultFontFamily: family };
+}
 export function renderTitle(spec) {
     const W = spec.width ?? 1920;
     const H = spec.height ?? 1080;
     const fontFiles = [];
     let family = spec.font_family || "Arial";
+    let warning;
     if (spec.font_file) {
         if (!fs.existsSync(spec.font_file))
             throw new Error(`Font file not found: ${spec.font_file}`);
@@ -52,6 +147,13 @@ export function renderTitle(spec) {
             throw new Error("font_file must be .ttf or .otf (convert .woff/.woff2 first).");
         fontFiles.push(spec.font_file);
         family = familyFromFontFile(spec.font_file) || family;
+    }
+    else if (spec.font_family && !/^(serif|sans-serif|monospace|cursive|fantasy)$/i.test(spec.font_family)) {
+        const fams = systemFamilies();
+        if (fams.size && !fams.has(spec.font_family.toLowerCase())) {
+            warning = `Font '${spec.font_family}' is not installed; rendered with Arial. Pass font_file (.ttf/.otf) or an installed family.`;
+            family = "Arial";
+        }
     }
     const align = spec.align || "center";
     const anchor = align === "left" ? "start" : align === "right" ? "end" : "middle";
@@ -83,7 +185,7 @@ export function renderTitle(spec) {
     });
     const bg = spec.background ? `<rect width="100%" height="100%" fill="${spec.background}"/>` : "";
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${defs}${bg}${parts.join("")}</svg>`;
-    const r = new Resvg(svg, { font: { fontFiles, loadSystemFonts: true, defaultFontFamily: family }, fitTo: { mode: "original" } });
+    const r = new Resvg(svg, { font: spec.font_file ? { fontFiles, loadSystemFonts: true, defaultFontFamily: family } : fontOptions(family), fitTo: { mode: "original" } });
     const png = r.render().asPng();
     fs.mkdirSync(path.dirname(spec.output), { recursive: true });
     let out = spec.output;
@@ -98,5 +200,5 @@ export function renderTitle(spec) {
         out = path.join(path.dirname(out), `${path.basename(out, ext)}__v${Date.now().toString(36)}${ext}`);
         fs.writeFileSync(out, png);
     }
-    return { path: out, width: W, height: H, family, renamed: out !== spec.output || undefined };
+    return { path: out, width: W, height: H, family, renamed: out !== spec.output || undefined, warning };
 }

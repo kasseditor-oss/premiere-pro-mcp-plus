@@ -70,7 +70,11 @@ export function autoThreshold(env) {
         return { floor: -90, threshold: -45 };
     const floor = s[Math.floor(s.length * 0.1)];
     const peak = s[Math.floor(s.length * 0.98)];
-    return { floor: r3(floor), peak: r3(peak), threshold: r3(Math.max(floor + 10, Math.min(peak - 20, floor + (peak - floor) * 0.35))) };
+    // Less than 15 dB between the noise floor and the peaks (constant noise, music,
+    // compressed live audio): there is no clear silence to find by volume.
+    if (peak - floor < 15)
+        return { floor: r3(floor), peak: r3(peak), threshold: r3(floor - 6), reliable: false };
+    return { floor: r3(floor), peak: r3(peak), threshold: r3(Math.min(peak - 12, Math.max(floor + 10, Math.min(peak - 20, floor + (peak - floor) * 0.35)))), reliable: true };
 }
 /** Onsets (energy rises) and a beat grid from the onset envelope's autocorrelation. */
 export async function beats(file, start, dur) {
@@ -311,7 +315,17 @@ export async function transcribe(file, opts) {
         args.push("--start", String(opts.start));
     if (opts.dur)
         args.push("--duration", String(opts.dur));
-    const { stdout } = await run(w.python, args, { maxBuffer: 64 * 1024 * 1024, timeout: 3_600_000, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+    if (!fs.existsSync(file))
+        throw Object.assign(new Error(`File not found: ${file}`), { code: "FILE_NOT_FOUND" });
+    let stdout = "";
+    try {
+        ({ stdout } = await run(w.python, args, { maxBuffer: 64 * 1024 * 1024, timeout: 3_600_000, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: "utf-8" } }));
+    }
+    catch (e) {
+        // Keep the last line of the Python error, not the whole traceback.
+        const lines = String(e?.stderr || e?.message || e).trim().split(/\r?\n/).filter(Boolean);
+        throw Object.assign(new Error(`Transcription failed: ${lines[lines.length - 1] || "unknown error"}`), { code: "TRANSCRIBE_FAILED", hint: "Run node dist/index.js --doctor to check faster-whisper; try model: 'base' or language." });
+    }
     return JSON.parse(stdout.slice(stdout.indexOf("{")));
 }
 export function ensureDir(d) {

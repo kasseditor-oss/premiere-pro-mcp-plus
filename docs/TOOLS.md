@@ -70,7 +70,7 @@
 | `add_transitions` | Add a video or audio transition at the start/end/both of many clips (default Cross Dissolve / Constant Power). |
 | `color` | `basic`, `read`, `match_shot`, `auto_balance`, `apply_lut`, `look` — Lumetri color on many clips. |
 | `stabilize` | `apply`, `status` — Apply Warp Stabilizer to clips and wait for Premiere's analysis (use async: true for long clips). |
-| `adjustment_layer` | Place an adjustment layer with a duration and effects (or a preset). |
+| `adjustment_layer` | Needs an Adjustment Layer already in the project (Premiere cannot create one by script: make one once with Project panel > New Item > Adjustment Layer). |
 | `scopes` | Measure a rendered frame of the sequence (luma mean/min/max, RGB means, crushed blacks / clipped whites %, color cast) to check exposure and color without looking. |
 | `mask_fit` | Frame a rectangle of the clip (face, object) to fill the sequence frame or a target box: computes Motion scale and position and applies them (static, or keyframed between from and to rects). |
 
@@ -80,7 +80,7 @@
 |---|---|
 | `set_volume` | Set clip level (db) or a dB envelope (keys [{t, db}]). |
 | `fade_audio` | Fade audio clips in/out with volume keyframes (language-independent). |
-| `audio` | `pan`, `gain`, `mute`, `unmute`, `solo_track`, `normalize`, `loudness`, `duck`, `detect_beats`, `detect_transients`, `effect`, `channel_mapping` — Audio on many clips. |
+| `audio` | `pan`, `gain`, `mute`, `unmute`, `solo_track`, `unsolo`, `normalize`, `loudness`, `duck`, `detect_beats`, `detect_transients`, `effect`, `channel_mapping` — Audio on many clips. |
 | `analyze_media` | `probe`, `silence`, `scenes`, `loudness`, `frames` — Analyze a media file locally with FFmpeg (no Premiere needed): probe streams, detect silences (for jump cuts), detect scene cuts, measure loudness (LUFS), or grab source frames as images. |
 
 ### Texto, gráficos e legendas
@@ -113,5 +113,5 @@
 | `recipes` | `list`, `get`, `save`, `delete`, `run` — Reusable workflows: a JSON list of tool calls with {{param}} placeholders ({{steps.<save>.<field>}} reads an earlier step's result). |
 | `batch` | Run several tool calls in order (stops at the first error unless continue_on_error). |
 | `undo` | Undo/redo whole tool calls: calls: N (default 1) rewinds Premiere's steps and the DOM edits of the last N calls; redo: true redoes them; steps: N is raw Ctrl+Z; history: true lists recorded calls. |
-| `run_extendscript` | Escape hatch: run ExtendScript in Premiere. |
+| `run_extendscript` | Escape hatch: run ExtendScript in Premiere (or UXP JavaScript with backend:'uxp'). |
 

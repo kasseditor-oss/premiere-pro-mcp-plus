@@ -7,6 +7,7 @@ import { BridgeError } from "./bridge.js";
 import * as an from "./analysis.js";
 import * as ae from "./autoedit.js";
 import * as media from "./media.js";
+import { confirmationsOn, consumeToken, issueToken } from "./policy.js";
 
 /**
  * Phase 3: automatic edits that really execute (not plans). Every action takes
@@ -23,25 +24,49 @@ export function registerPhase3(ctx: any) {
   async function speech(sequence: string | undefined, sel: any, noiseDb?: number, join = 0.15) {
     const clips = (await sources(sequence, sel)).filter((c) => !c.video && c.media && !c.disabled);
     if (!clips.length) throw new BridgeError("NO_AUDIO", "No audio clips with media matched the voice selector.", "Pass voice: {tracks:['A1']} or clip ids.");
-    const out: { clip: any; active: ae.Range[]; threshold: number }[] = [];
+    const out: { clip: any; active: ae.Range[]; threshold: number; reliable: boolean; floor?: number; peak?: number }[] = [];
     for (const c of clips) {
       const env = await an.envelope(c.media, 0.02, c.in, c.out - c.in);
-      const th = noiseDb ?? an.autoThreshold(env).threshold;
+      const at: any = an.autoThreshold(env);
+      const th = noiseDb ?? at.threshold;
       const act = an.activeRegions(env, th, join, 0.06).map((r) => ({ start: toSeq(c, c.in + r.start), end: toSeq(c, c.in + r.end) }));
-      out.push({ clip: c, active: act, threshold: th });
+      out.push({ clip: c, active: act, threshold: th, reliable: noiseDb !== undefined || at.reliable !== false, floor: at.floor, peak: at.peak });
     }
     return out;
   }
+  /** Seconds of the sequence spanned by these clips (for the "how much does this cut" check). */
+  const spanOf = (clips: any[]) => {
+    const r = ae.mergeRanges(clips.map((c) => ({ start: c.start, end: c.end })));
+    return r.reduce((n, x) => n + x.end - x.start, 0);
+  };
   /** Transcript words in sequence time: from an id/file, or transcribe the voice clips now. */
   async function transcriptFor(a: any) {
     if (a.transcript) return ctx.loadTranscript(a.transcript);
     const r: any = await run("transcribe", { sequence: a.sequence, clips: a.voice ?? { kind: "audio", tracks: ["A1"] }, language: a.language, model: a.model });
     return JSON.parse(fs.readFileSync(r.path, "utf-8"));
   }
-  async function cut(a: any, ranges: ae.Range[], extra: any) {
+  /**
+   * Ripple-delete the ranges. Cuts that remove more than max_cut (default 40%) of
+   * the material need a confirmation token (or a preview first): a wrong
+   * threshold must never wipe a sequence silently.
+   */
+  async function cut(a: any, ranges: (ae.Range & { reason?: string; text?: string })[], extra: any, span?: number) {
     const merged = ae.mergeRanges(ranges, 0.02);
     const total = ae.r3(merged.reduce((n, r) => n + (r.end - r.start), 0));
-    if (a.preview || !merged.length) return { preview: !!a.preview, ranges: merged, count: merged.length, seconds: total, ...extra };
+    const detail = ranges.length && ranges.some((r) => r.reason) ? [...ranges].sort((x, y) => x.start - y.start).map((r) => ({ start: ae.r3(r.start), end: ae.r3(r.end), reason: r.reason, text: r.text })) : undefined;
+    const share = span && span > 0 ? ae.r3(total / span) : undefined;
+    if (a.preview || !merged.length) return { preview: !!a.preview, ranges: merged, count: merged.length, seconds: total, share, detail, ...extra };
+    const limit = a.max_cut ?? 0.4;
+    if (share !== undefined && share > limit && confirmationsOn()) {
+      if (a.confirm_token) consumeToken("auto_edit", a);
+      else
+        return {
+          status: "needs_confirmation",
+          preview: { ranges: merged, count: merged.length, seconds: total, share, detail, ...extra },
+          confirm_token: issueToken("auto_edit", a),
+          hint: `This removes ${Math.round(share * 100)}% of the material (limit ${Math.round(limit * 100)}%). Check the ranges; repeat the same call with confirm_token to apply, or change the thresholds.`,
+        };
+    }
     const before: any = await call("get_sequence_settings", { sequence: a.sequence });
     const r: any = await call("ripple_delete_ranges", { sequence: a.sequence, ranges: merged, tracks: a.tracks }, 900000);
     const after: any = await call("get_sequence_settings", { sequence: a.sequence });
@@ -51,7 +76,7 @@ export function registerPhase3(ctx: any) {
   tool(
     "auto_edit",
     "Automatic edits",
-    "Edits that run end to end (preview: true shows the plan without editing; checkpoint: true clones the sequence first). jump_cut: remove silences of the voice with padding and ripple on all tracks, optional alternating punch-in (zoom 100<->106). remove_fillers: remove filler words (pt/en lists, configurable), shorten long pauses, drop repeated takes (keeps the last). beat_montage: place items cut on the music's beats (every N beats). emphasis_zoom: punch-in keyframes at keywords (transcript) or loudness peaks. multicam: switch between angle tracks to whoever is speaking (audio energy, minimum shot length). speaker_reframe: keep the speaker centered in a vertical sequence (by speaker audio, or by frame analysis), smooth keyframes. shorts: rank the best windows of a long clip and build a 9:16 sequence per window with reframe, styled captions and a CTA (optional export). chapters: chapter markers + YouTube text from the transcript or markers. mix: voice to -16 LUFS, music ducked under the voice, mix to -14 LUFS / -1 dBTP verified on an export. sync_audio: line up an external recording with the camera audio by correlation and place it. visual_qa: list problems with timecodes (black frames, flashes, offline, disabled, gaps, audio clipping, captions outside the safe zone) + contact sheet. paper_edit: build a sequence from script lines matched to the transcript, in script order.",
+    "Edits that run end to end (preview: true shows the plan without editing; checkpoint: true clones the sequence first). jump_cut: remove silences of the voice with padding and ripple on all tracks, optional alternating punch-in (zoom 100<->106). remove_fillers: remove filler words (per-language list, configurable), shorten quiet pauses, drop repeated takes (keeps the last). Both return detail (each range with its reason) and ask for confirmation above max_cut. beat_montage: place items cut on the music's beats (every N beats). emphasis_zoom: punch-in keyframes at keywords (transcript) or loudness peaks. multicam: switch between angle tracks to whoever is speaking (audio energy, minimum shot length). speaker_reframe: keep the speaker centered in a vertical sequence (by speaker audio, or by frame analysis), smooth keyframes. shorts: rank the best windows of a long clip and build a 9:16 sequence per window with reframe, styled captions and a CTA (optional export). chapters: chapter markers + YouTube text from the transcript or markers. mix: voice to -16 LUFS, music ducked under the voice, mix to -14 LUFS / -1 dBTP verified on an export. sync_audio: line up an external recording with the camera audio by correlation and place it. visual_qa: list problems with timecodes (black frames, flashes, offline, disabled, gaps, audio clipping, captions outside the safe zone) + contact sheet. paper_edit: build a sequence from script lines matched to the transcript, in script order.",
     {
       action: z.enum(["jump_cut", "remove_fillers", "beat_montage", "emphasis_zoom", "multicam", "speaker_reframe", "shorts", "chapters", "mix", "sync_audio", "visual_qa", "paper_edit"]),
       sequence: seqArg,
@@ -70,10 +95,13 @@ export function registerPhase3(ctx: any) {
       transcript: z.string().optional().describe("Transcript id (tr_...) or JSON path; default: transcribe the voice now"),
       language: z.string().optional(),
       model: z.enum(["tiny", "base", "small", "medium", "large-v3"]).optional(),
-      fillers: z.array(z.string()).optional().describe("Override the filler list (default pt + en)"),
+      fillers: z.array(z.string()).optional().describe("Override the filler list (default: the language's list; accents count, 'é' is not 'e')"),
       max_pause: z.number().optional().describe("remove_fillers: pauses longer than this are shortened (s), default 0.8"),
       keep_pause: z.number().optional().describe("remove_fillers: pause kept (s), default 0.25"),
       repeated: z.boolean().optional().describe("remove_fillers: drop repeated takes (default true)"),
+      max_gap: z.number().optional().describe("remove_fillers: gaps longer than this are never cut (s), default 3"),
+      max_cut: z.number().optional().describe("jump_cut / remove_fillers: share of the material that can go without confirmation, default 0.4"),
+      confirm_token: z.string().optional().describe("Token from a needs_confirmation answer (single use)"),
       // beat montage
       items: z.array(z.string()).optional().describe("beat_montage: project items to place (cycled)"),
       every: z.number().int().optional().describe("beat_montage: beats per clip, default 2"),
@@ -123,7 +151,11 @@ export function registerPhase3(ctx: any) {
           for (const s of sp) ranges.push(...ae.silencesBetween(s.active, s.clip.start, s.clip.end, a.min_silence ?? 0.5, a.padding ?? 0.12));
           // Only cut where every voice track is silent.
           const silentEverywhere = ranges.filter((r) => sp.every((s) => !s.active.some((x) => x.start < r.end - 0.01 && x.end > r.start + 0.01)));
-          const res: any = await cut(a, silentEverywhere, { thresholds: sp.map((s) => s.threshold) });
+          const noisy = sp.filter((s) => !s.reliable);
+          const extra: any = { thresholds: sp.map((s) => s.threshold) };
+          if (noisy.length)
+            extra.warning = `No clear silence in ${noisy.length} voice clip(s): noise floor ${noisy[0].floor} dBFS vs peaks ${noisy[0].peak} dBFS (constant noise, music or compressed audio). Nothing was cut there. Pass noise_db (e.g. ${ae.r3((noisy[0].floor ?? -40) + 3)}) to force a threshold.`;
+          const res: any = await cut(a, silentEverywhere.map((r) => ({ ...r, reason: "silence" })), extra, spanOf(sp.map((s) => s.clip)));
           if (!a.preview && a.zoom && res.count) {
             const vt = a.zoom_track || "V1";
             const vs: any = await call("find_clips", { sequence: a.sequence, clips: { tracks: [vt] } });
@@ -136,11 +168,36 @@ export function registerPhase3(ctx: any) {
         // ------------------------------------------------------------ 2 fillers / pauses / repeated takes
         case "remove_fillers": {
           const tr = await transcriptFor(a);
-          const list = a.fillers?.length ? a.fillers : [...ae.FILLERS.pt, ...ae.FILLERS.en];
-          const fill = ae.fillerRanges(tr.words, list).map((r) => ({ ...r, start: r.start - 0.03, end: r.end + 0.03 }));
-          const pauses = ae.longPauses(tr.words, a.max_pause ?? 0.8, a.keep_pause ?? 0.25);
+          const lang = String(a.language || tr.language || "").slice(0, 2).toLowerCase();
+          const list = a.fillers?.length ? a.fillers : ae.fillersFor(lang);
+          const fill = ae.fillerRanges(tr.words, list, a.fillers?.length ? [] : undefined).map((r) => ({ ...r, start: r.start - 0.03, end: r.end + 0.03 }));
+          // Pauses: only gaps where the voice is really quiet. A long gap between
+          // transcribed words is often speech Whisper skipped (overlap, noise).
+          const maxGap = a.max_gap ?? 3;
+          let pauses: (ae.Range & { reason: string })[] = ae.longPauses(tr.words, a.max_pause ?? 0.8, a.keep_pause ?? 0.25).map((p) => ({ ...p, reason: "pause" }));
+          const skipped: ae.Range[] = pauses.filter((p) => p.end - p.start > maxGap);
+          pauses = pauses.filter((p) => p.end - p.start <= maxGap);
+          let audioChecked = false;
+          if (!a.transcript || a.voice) {
+            try {
+              const sp = await speech(a.sequence, a.voice ?? { kind: "audio", tracks: ["A1"] });
+              const loud = (p: ae.Range) => sp.some((s) => !s.reliable && s.clip.start < p.end && s.clip.end > p.start) || sp.some((s) => s.active.some((x) => Math.min(x.end, p.end) - Math.max(x.start, p.start) > 0.15));
+              skipped.push(...pauses.filter(loud));
+              pauses = pauses.filter((p) => !loud(p));
+              audioChecked = true;
+            } catch {
+              /* no voice clips: transcript only */
+            }
+          }
           const takes = a.repeated === false ? [] : ae.repeatedTakes(tr.segments);
-          const res: any = await cut(a, [...fill, ...pauses, ...takes], { fillers: fill.map((f) => ({ word: f.word, at: ae.r3(f.start) })), pauses: pauses.length, repeatedTakes: takes.map((t) => ({ text: t.text, at: t.start, keptAt: t.keptAt })) });
+          const all = [
+            ...fill.map((f) => ({ start: f.start, end: f.end, reason: "filler", text: f.word })),
+            ...pauses,
+            ...takes.map((t) => ({ start: t.start, end: t.end, reason: "repeated_take", text: t.text })),
+          ];
+          const span = tr.words.length ? Math.max(...tr.words.map((w: any) => w.end)) - Math.min(...tr.words.map((w: any) => w.start)) : undefined;
+          const res: any = await cut(a, all, { language: lang || undefined, fillers: fill.map((f) => ({ word: f.word, at: ae.r3(f.start) })), pauses: pauses.length, repeatedTakes: takes.map((t) => ({ text: t.text, at: t.start, keptAt: t.keptAt })), pausesNotCut: skipped.length ? skipped.map((p) => ({ start: ae.r3(p.start), end: ae.r3(p.end) })) : undefined, audioChecked }, span);
+          if (skipped.length) res.warning = `${skipped.length} gap(s) between words were not cut: longer than ${maxGap}s or with sound in them (probably speech the transcript missed).`;
           if (!a.transcript) res.note = "Transcript times are sequence times of the voice clips at the moment of the call.";
           return res;
         }
@@ -392,8 +449,10 @@ export function registerPhase3(ctx: any) {
           if (!wav) throw new BridgeError("PRESET_NOT_FOUND", "No 'Waveform Audio' export preset to measure the mix.");
           const dir = path.join(os.tmpdir(), "premiere-mcp-plus", "mix");
           ensureOutputDir(dir);
+          let lastFile = "";
           const measure = async (n: number) => {
             const r: any = await run("export_sequence", { sequence: a.sequence, output: path.join(dir, `mix_${Date.now()}_${n}.wav`), preset_path: wav });
+            lastFile = r.path;
             return an.loudnessOf(r.path);
           };
           prog(0.5, "measure");
@@ -416,7 +475,16 @@ export function registerPhase3(ctx: any) {
           prog(0.85, "verify");
           const m2 = await measure(2);
           const ok = m2.lufs !== null && m2.truePeak !== null && m2.truePeak <= tp + 0.15 && (Math.abs(m2.lufs - target) <= 1 || m2.truePeak >= tp - 0.3);
-          return { voice: nv.clips?.map((c: any) => ({ id: c.id, setDb: c.setDb })), ducking: dk.music ? dk.music.length : dk, before: m1, gainDb: gain, after: m2, target: { lufs: target, truePeak: tp }, verified: ok, note: m2.lufs !== null && Math.abs(m2.lufs - target) > 1 ? "The true-peak limit stopped the gain before the loudness target; add a limiter (audio effect Hard Limiter) for more loudness." : undefined };
+          // export / folder: keep the measured mix (the file the numbers above come from).
+          let file: string | undefined;
+          if ((a.export || a.folder) && lastFile && fs.existsSync(lastFile)) {
+            const outDir = path.resolve(a.folder || path.dirname(lastFile));
+            ensureOutputDir(outDir);
+            const seqName = String(((await call("get_sequence_settings", { sequence: a.sequence })) as any).name || "sequence").replace(/[\\/:*?"<>|]+/g, "_");
+            file = path.join(outDir, `${seqName}_mix.wav`);
+            fs.copyFileSync(lastFile, file);
+          }
+          return { file, voice: nv.clips?.map((c: any) => ({ id: c.id, setDb: c.setDb })), ducking: dk.music ? dk.music.length : dk, before: m1, gainDb: gain, after: m2, target: { lufs: target, truePeak: tp }, verified: ok, note: m2.lufs !== null && Math.abs(m2.lufs - target) > 1 ? "The true-peak limit stopped the gain before the loudness target; add a limiter (audio effect Hard Limiter) for more loudness." : undefined };
         }
         // ------------------------------------------------------------ 10 sync external audio
         case "sync_audio": {
@@ -427,9 +495,21 @@ export function registerPhase3(ctx: any) {
           const s = await an.syncOffset(cam.media, ext, 60);
           // External time = camera media time - offset.
           const extAtStart = cam.in - s.offset;
-          const spec: any = { track: a.track || "A9", media: "audio" };
+          const spec: any = { media: "audio" };
           if (extAtStart >= 0) Object.assign(spec, { start: cam.start, in: ae.r3(extAtStart) });
           else Object.assign(spec, { start: ae.r3(cam.start - extAtStart / (cam.speed || 1)), in: 0 });
+          // Default track: the first audio track free over the whole placement, else a new one.
+          if (a.track) spec.track = a.track;
+          else {
+            const extDur = (await media.probe(ext)).duration || 0;
+            const span = { start: spec.start, end: spec.start + Math.max(0, extDur - spec.in) };
+            const st: any = await call("get_sequence_settings", { sequence: a.sequence });
+            const all: any = await call("find_clips", { sequence: a.sequence, clips: { kind: "audio" } });
+            const busy = new Set(all.clips.filter((c: any) => c.start < span.end - 0.01 && c.end > span.start + 0.01).map((c: any) => String(c.track).toUpperCase()));
+            let n = 1;
+            while (n <= st.audioTracks && busy.has(`A${n}`)) n++;
+            spec.track = `A${n}`;
+          }
           if (a.preview) return { preview: true, offset: s.offset, confidence: s.confidence, placement: spec };
           const imp: any = await call("import_files", { paths: [ext], bin: "_MCP Plus/Synced audio" });
           const pl: any = await call("place_clips", { sequence: a.sequence, clips: [{ ...spec, item: imp.imported[0].id }], auto_create_tracks: true });
@@ -543,10 +623,13 @@ export function registerPhase3(ctx: any) {
     if (!r) throw new BridgeError("RECIPE_NOT_FOUND", `No recipe '${name}'.`, "recipes action 'list'.");
     const vars: any = { ...(r.params || {}), ...(params || {}), steps: {} };
     const results: any[] = [];
+    const known = Object.keys(r.params || {});
+    const unknown = Object.keys(params || {}).filter((k) => !known.includes(k));
+    const warning = unknown.length ? `Unknown params ignored: ${unknown.join(", ")}. This recipe takes: ${known.join(", ")}.` : undefined;
     for (const [i, s] of r.steps.entries()) {
       jctx?.progress?.(i / r.steps.length, `${s.tool}`);
       if (s.when && !fill(`{{${s.when}}}`, vars)) {
-        results.push({ step: i, tool: s.tool, skipped: true });
+        results.push({ step: i, tool: s.tool, skipped: true, reason: `param '${s.when}' is empty; pass params.${s.when} to run this step` });
         continue;
       }
       const args = fill(s.args || {}, vars);
@@ -559,13 +642,17 @@ export function registerPhase3(ctx: any) {
         let out: any = await t.handler(parsed.data);
         if (out && Array.isArray(out.content)) out = JSON.parse(out.content.find((c: any) => c.type === "text")?.text || "{}");
         if (s.save) vars.steps[s.save] = out;
+        if (out?.status === "needs_confirmation") {
+          results.push({ step: i, tool: s.tool, ok: false, status: "needs_confirmation", hint: out.hint, preview: out.preview });
+          return { recipe: name, results, completed: false, warning, note: `Step ${i} (${s.tool}) needs confirmation. Review the preview, then run that step by hand with its confirm_token, or raise max_cut in the recipe.` };
+        }
         results.push({ step: i, tool: s.tool, ok: true, status: out?.status ?? (out?.verified === false ? "failed" : out?.verified ? "verified" : undefined) });
       } catch (e: any) {
         results.push({ step: i, tool: s.tool, ok: false, code: e.code, error: e.message });
-        return { recipe: name, results, completed: false };
+        return { recipe: name, results, completed: false, warning };
       }
     }
-    return { recipe: name, results, completed: true, verified: results.every((x) => x.ok || x.skipped) };
+    return { recipe: name, results, completed: true, warning, verified: results.every((x) => x.ok || x.skipped) };
   }
 
   tool(

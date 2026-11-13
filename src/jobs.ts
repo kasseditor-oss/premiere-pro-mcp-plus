@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { BridgeError } from "./bridge.js";
 
 export type JobState = "running" | "done" | "failed" | "cancelled";
@@ -33,6 +35,51 @@ interface Job {
  */
 export class JobManager {
   private jobs = new Map<string, Job>();
+  /** Folder where each job's status is saved, so another server process (after a restart) can still report it. */
+  constructor(private dir?: string) {
+    if (dir) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        // Keep the 100 most recent job files.
+        const files = fs.readdirSync(dir).filter((f) => /^job_.*\.json$/.test(f)).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
+        for (const x of files.slice(100)) fs.rmSync(path.join(dir, x.f), { force: true });
+      } catch {
+        this.dir = undefined;
+      }
+    }
+  }
+  private save(j: Job) {
+    if (!this.dir) return;
+    try {
+      let text = JSON.stringify({ ...this.status(j.id, true), pid: process.pid, startedAt: j.startedAt });
+      if (text.length > 2_000_000) text = JSON.stringify({ ...this.status(j.id, false), pid: process.pid, startedAt: j.startedAt, resultTooLarge: true });
+      fs.writeFileSync(path.join(this.dir, j.id + ".json"), text, "utf-8");
+    } catch {
+      /* status on disk is best effort */
+    }
+  }
+  /** A job saved by another server process (e.g. before a restart). */
+  private fromDisk(id: string): any | null {
+    if (!this.dir || !/^job_[0-9a-f]+$/.test(id)) return null;
+    try {
+      const d = JSON.parse(fs.readFileSync(path.join(this.dir, id + ".json"), "utf-8"));
+      if (d.state === "running" && d.pid !== process.pid) {
+        let alive = false;
+        try {
+          process.kill(d.pid, 0);
+          alive = true;
+        } catch {
+          /* gone */
+        }
+        if (!alive) Object.assign(d, { state: "lost", note: "The server process that ran this job stopped before it finished (Claude or the server restarted). Check Premiere and run it again if needed." });
+        else d.note = "Running in another server process.";
+      }
+      d.fromDisk = true;
+      return d;
+    } catch {
+      return null;
+    }
+  }
 
   start(tool: string, run: (ctx: JobContext) => Promise<unknown>): string {
     const id = "job_" + randomBytes(4).toString("hex");
@@ -52,14 +99,17 @@ export class JobManager {
         job.result = r;
         job.progress = 1;
         job.endedAt = Date.now();
+        this.save(job);
       },
       (e: any) => {
         job.state = job.cancelRequested ? "cancelled" : "failed";
         job.error = { code: e?.code || "JOB_FAILED", message: String(e?.message || e), hint: e?.hint };
         job.endedAt = Date.now();
+        this.save(job);
       },
     );
     this.jobs.set(id, job);
+    this.save(job);
     // Keep the 50 most recent jobs.
     if (this.jobs.size > 50) {
       for (const [k, j] of this.jobs) {
@@ -79,6 +129,13 @@ export class JobManager {
   }
 
   status(id: string, withResult = true) {
+    if (!this.jobs.has(id)) {
+      const d = this.fromDisk(id);
+      if (d) {
+        if (!withResult) delete d.result;
+        return d;
+      }
+    }
     const j = this.get(id);
     const elapsed = (j.endedAt || Date.now()) - j.startedAt;
     const out: any = { job_id: j.id, tool: j.tool, state: j.state, elapsedMs: elapsed };
@@ -91,6 +148,10 @@ export class JobManager {
   }
 
   async wait(id: string, timeoutMs: number) {
+    if (!this.jobs.has(id)) {
+      const d = this.fromDisk(id);
+      if (d) return d;
+    }
     const j = this.get(id);
     if (j.state === "running") await Promise.race([j.done, new Promise((r) => setTimeout(r, timeoutMs))]);
     const s = this.status(id);
@@ -105,6 +166,25 @@ export class JobManager {
   }
 
   list() {
-    return [...this.jobs.values()].reverse().map((j) => this.status(j.id, false));
+    const mine = [...this.jobs.values()].reverse().map((j) => this.status(j.id, false));
+    if (!this.dir) return mine;
+    // Plus jobs of earlier server processes, newest first.
+    let other: any[] = [];
+    try {
+      other = fs
+        .readdirSync(this.dir)
+        .filter((f) => /^job_[0-9a-f]+\.json$/.test(f) && !this.jobs.has(f.slice(0, -5)))
+        .map((f) => this.fromDisk(f.slice(0, -5)))
+        .filter(Boolean)
+        .map((d) => {
+          delete d.result;
+          return d;
+        })
+        .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))
+        .slice(0, 30);
+    } catch {
+      /* none */
+    }
+    return [...mine, ...other];
   }
 }

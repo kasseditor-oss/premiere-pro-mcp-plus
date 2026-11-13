@@ -63,7 +63,7 @@ while ($true) {
 export const PROGRESS = [/^(Exporting|Rendering|Importing|Conforming|Analy[sz]ing|Saving|Encoding|Generating|Loading|Indexing|Reading|Building)/i, /Scene Edit Detection/i, /Auto Reframe/i, /Progress/i, /^(Exportando|Renderizando|Importando|Analisando|Salvando|Gerando|Carregando|Codificando|Detec)/i];
 
 /** Titles of Premiere dialogs that are safe to dismiss automatically (informational logs). */
-export const AUTO_CLOSE = [/AAF Export Log/i, /Translation Re(port|sults)/i, /Relat[oó]rio de tradu/i, /Log de exporta/i];
+export const AUTO_CLOSE = [/AAF Export Log/i, /Translation Re(port|sults)/i, /Relat[oó]rio de tradu/i, /Log de exporta/i, /File Import Failure/i, /Falha (na|de) importa/i];
 
 export class DialogWatcher {
   private proc: ChildProcessWithoutNullStreams | null = null;

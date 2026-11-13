@@ -3,6 +3,8 @@
 - `npm test` - ES3 syntax check of the host library, panel syntax check, MCP stdio smoke test.
 - `node tests/e2e-premiere.mjs <folder>` - live test against a running Premiere Pro (includes one test per item of each bug report).
 - `node tests/e2e-bugfixes.mjs [folder]` - regression test for the first bug report.
+- `node tests/unit.mjs` - offline tests of the planning helpers, jobs and fonts (part of `npm test`).
+- `node tests/e2e-v253.mjs <folder>` - live checks of the fixes from the v2.5.2 test report; one section runs with confirmation tokens on, as users get by default (`V253_ONLY=freeze,jump_cut,...`).
 - Close other projects in Premiere before running them: with several projects open, scripts can act on the wrong one.
 
 Generate the media for the live test (FFmpeg):

@@ -147,13 +147,14 @@ Prioridade de desenvolvimento e testes: 2026 e 2027 (testado assim que for lanç
 ## Testes
 
 ```bash
-npm test                          # ES3 do host, sintaxe do painel, smoke MCP
+npm test                          # ES3 do host, sintaxe do painel, unitários, smoke MCP
 node tests/make-media.mjs         # mídia sintética (fala TTS, música 120 BPM, dois ângulos...)
 node tests/e2e-premiere.mjs       # base (123 testes)
 node tests/e2e-bugfixes.mjs       # regressão dos bugs antigos (18)
 node tests/e2e-phase1.mjs         # arquitetura (41)
 node tests/e2e-phase2.mjs         # paridade, uma checagem por ação (168)
 node tests/e2e-phase3.mjs         # edições automáticas (63)
+node tests/e2e-v253.mjs           # correções do relatório da 2.5.2, com confirmação ligada (45)
 node bench/bench.mjs              # desempenho
 ```
 

@@ -141,6 +141,7 @@ function fourcc(n) {
         return "";
     return [24, 16, 8, 0].map((b) => String.fromCharCode((n >>> b) & 255)).join("").trim();
 }
+const CONTAINERS = { H264: "mp4", HEVC: "mp4", MooV: "mov", AVIV: "avi", WAVE: "wav", AIFF: "aif", MP3: "mp3", PNG: "png", JPEG: "jpg", TIFF: "tif", DPX: "dpx", GIFf: "gif", MXFf: "mxf" };
 const FORMAT_NAMES = { H264: "H.264", HEVC: "HEVC (H.265)", MooV: "QuickTime", AVIV: "AVI", WAVE: "Waveform Audio", AIFF: "AIFF", MP3: "MP3", PNG: "PNG", JPEG: "JPEG", TIFF: "TIFF", DPX: "DPX", GIFf: "Animated GIF" };
 export function findExportPresets(filter) {
     const roots = [
@@ -172,10 +173,12 @@ export function findExportPresets(filter) {
                 let name = e.name.replace(/\.epr$/i, "");
                 let format = "";
                 let folder = "";
+                let container = "";
                 try {
                     const head = fs.readFileSync(full, "utf-8").slice(0, 4000);
                     folder = (/<FolderDisplayPath>([^<]*)<\/FolderDisplayPath>/.exec(head)?.[1] || "").trim();
                     const cc = fourcc(Number(/<ExporterFileType>(\d+)<\/ExporterFileType>/.exec(head)?.[1]));
+                    container = CONTAINERS[cc] || "";
                     format = (folder.includes("/") ? folder.split("/").pop() : "") || FORMAT_NAMES[cc] || cc;
                     const n = /<PresetName>([^<]+)<\/PresetName>/.exec(head) || /<Name>([^<]+)<\/Name>/.exec(head);
                     if (n)
@@ -195,7 +198,7 @@ export function findExportPresets(filter) {
                 if (re && !re.test(name) && !re.test(format) && !re.test(folder) && !re.test(full))
                     continue;
                 seen.add(key);
-                out.push({ name, path: full.replace(/\\/g, "/"), source, format: format || undefined, folder: folder || undefined });
+                out.push({ name, path: full.replace(/\\/g, "/"), source, format: format || undefined, folder: folder || undefined, container: container || undefined });
             }
         }
     };

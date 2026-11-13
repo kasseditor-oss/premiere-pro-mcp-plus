@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.5.3 — correções do relatório de testes da 2.5.2
+
+- `auto_edit jump_cut`: com ruído constante (menos de 15 dB entre o piso e os picos) o threshold automático não corta nada e avisa; antes cortava a sequência inteira. Cortes acima de `max_cut` (padrão 40% do material) pedem `confirm_token`. O preview traz `share` e `detail` (cada trecho com o motivo).
+- `auto_edit remove_fillers`: lista de vícios por idioma, comparando com acento ("é" ≠ "e"); "e", "um" e outras palavras funcionais nunca são vício; "é" e "né" só contam isolados por pausa. Pausas só são cortadas quando o áudio está quieto e têm no máximo `max_gap` (padrão 3 s); as outras voltam em `pausesNotCut` com aviso.
+- `edit_clips freeze_frame`: `at` é tempo da sequência e precisa cair dentro do clip (senão `BAD_ARGS`); novo `offset` (segundos dentro do clip). O resto do clip depois do congelamento não é mais sobrescrito pelo still.
+- Mídia que o Premiere não decodifica: o diálogo "File Import Failure" fecha sozinho e `import_media` avisa; `get_item_info` avisa vídeo sem frame rate; `place_clips` devolve `UNSUPPORTED_MEDIA`.
+- `auto_edit mix` com `folder` (ou `export`) grava o WAV medido e devolve `file`.
+- Escritas sem `clips` (`color`, `audio`, `stabilize`) dão `BAD_ARGS` em vez de agir em todos os clips.
+- `audio`: `mute`/`unmute` com `tracks` e sem `clips` agem nas tracks; nova ação `unsolo`.
+- `run_extendscript` aceita `backend: "uxp"` (JavaScript no plugin UXP).
+- `stabilize` só diz que a análise terminou depois de vê-la rodando; senão `committed_unverified` com nota.
+- `transcribe`: `FILE_NOT_FOUND` antes de chamar o Python; erros do Python viram uma linha (`TRANSCRIBE_FAILED`).
+- `sync_audio` usa a primeira track de áudio livre.
+- `captions edit` diz que o transcript não muda e que o resultado é o arquivo em `path`.
+- `create_title_image` avisa quando a fonte não está instalada.
+- `list_export_presets` mostra `container` (mp4, mov...) e, em buscas H.264/HEVC, lista os que gravam .mp4 primeiro.
+- `jobs` gravados em disco: outro processo do servidor (depois de reiniciar o Claude) ainda vê o resultado; jobs interrompidos aparecem como `lost`.
+- Receitas: passo pulado diz o motivo; parâmetros desconhecidos geram aviso; passo que pede confirmação para a receita com nota.
+- Cards de legenda (`captions burn_style`) e títulos: só as fontes da família são carregadas, 459 → 53 ms por card.
+- Testes: `tests/unit.mjs` (no `npm test`) e `tests/e2e-v253.mjs` (ao vivo, inclui confirmação com o padrão ligado).
+
 ## 2.5.2
 
 - Correção do 2.5.1: o 2024 e o 2025 continuam funcionando pelo CEP (UXP a partir do 25.6). A prioridade de desenvolvimento e testes é o 2026 e o 2027; `premiere_status` mostra `versionNote` abaixo da 26.

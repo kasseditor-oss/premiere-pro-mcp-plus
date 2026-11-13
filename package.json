@@ -1,6 +1,6 @@
 {
   "name": "premiere-pro-mcp-plus",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "description": "Improved MCP server for Adobe Premiere Pro: fast event-driven CEP bridge, JSON-RPC host library, batch timeline building, effect presets, title images, frame previews and an inline MCP App activity widget.",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs",
     "start": "node dist/index.js",
-    "test": "npx -y acorn@8 --ecma3 --silent host/premiere-lib.jsx && node scripts/check-es3.mjs && node --check cep/main.js && node tests/smoke-mcp.mjs",
+    "test": "npx -y acorn@8 --ecma3 --silent host/premiere-lib.jsx && node scripts/check-es3.mjs && node --check cep/main.js && node tests/unit.mjs && node tests/smoke-mcp.mjs",
     "install-cep": "node dist/index.js --install-cep",
     "setup": "npm run build && node dist/index.js --setup",
     "test:e2e": "node tests/e2e-premiere.mjs && node tests/e2e-phase1.mjs && node tests/e2e-phase2.mjs && node tests/e2e-phase3.mjs",

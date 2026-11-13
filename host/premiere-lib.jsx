@@ -869,6 +869,12 @@
     return { items: out, total: total, truncated: total > out.length };
   };
 
+  // A video file Premiere imported but cannot decode (VP9/AV1 in MP4...): no frame rate.
+  function undecodableVideo(it) {
+    var mp = itemMediaPath(it);
+    if (!mp || !/\.(mp4|m4v|mov|mkv|webm|avi|mxf|mts|m2ts|wmv|flv)$/i.test(mp)) return false;
+    try { var fi = it.getFootageInterpretation(); return !(fi && fi.frameRate > 0); } catch (e) { return false; }
+  }
   H.get_item_info = function (a) {
     var it = resolveItem(a.item);
     var d = describeItem(it, undefined, true);
@@ -880,6 +886,7 @@
       else { delete d["in"]; delete d.out; d.note = "Subclip bounds could not be read; duration comes from the project metadata."; }
     }
     try { var m = it.getMarkers(); if (m) d.markers = m.numMarkers; } catch (e3) {}
+    if (undecodableVideo(it)) d.warning = "Premiere reports no frame rate for this video file: its codec is probably not supported (e.g. VP9/AV1 in MP4). Transcode it (encode / media create_proxies) before editing.";
     if (a.metadata || a.raw_xml) {
       var pm = "", xmp = "";
       try { pm = String(it.getProjectMetadata()); } catch (e4) {}
@@ -977,7 +984,9 @@
         for (var t = 0; t < target.children.numItems; t++) if (String(target.children[t].nodeId) === String(c.nodeId)) inTarget = true;
         if (!inTarget) { try { c.moveBin(target); } catch (eMv) {} }
       }
-      created.push(describeItem(c, binPathOf(c), false));
+      var dc = describeItem(c, binPathOf(c), false);
+      if (undecodableVideo(c)) dc.warning = "No frame rate: Premiere probably cannot decode this video codec. Transcode it before editing.";
+      created.push(dc);
     }
     return { imported: created, missing: missing, requested: paths.length };
   };
@@ -1543,6 +1552,7 @@
     var ft = frameTicks(seq), tol = ft / 2 + 2;
     var host = vt || at;
     placed = findPlacedClip(host.track, startTicks, placeItem.nodeId, tol);
+    if (!placed && vt && undecodableVideo(it)) fail("UNSUPPORTED_MEDIA", "Premiere cannot decode the video of '" + it.name + "' (no frame rate; codec probably unsupported, e.g. VP9/AV1).", "Transcode it to H.264 first (encode with an H.264 preset, or media create_proxies).");
     if (!placed) fail("PLACE_UNVERIFIED", "Edit ran but no clip was found at " + r3(ticksToSec(startTicks)) + "s on " + host.label + ".");
     // From here on the clip exists: any failure removes it again (with its
     // linked audio) so an error never leaves a clip on the timeline.
@@ -3685,11 +3695,15 @@
       var atT = snapTicks(s, secToTicks(at)), durT = snapTicks(s, secToTicks(a.duration || 2));
       var qs5 = qeSequenceFor(s);
       if (parseFloat(cl5.start.ticks) < atT - 1 && parseFloat(cl5.end.ticks) > atT + 1) qs5.getVideoTrackAt(parseTrackRef(e5.track).index).razor(timecodeFor(s, atT), true, true);
-      var shiftTracks = a.ripple === false ? [] : [e5.trackObj];
-      if (a.ripple !== false) { var lk5 = linkedEntries(s, cl5); for (var u = 0; u < lk5.length; u++) shiftTracks.push(lk5[u].trackObj); }
+      // Track objects read before the QE razor are stale (they miss the new piece): fetch them again.
+      var lk5 = a.ripple === false ? [] : linkedEntries(s, cl5);
+      var shiftLabels = a.ripple === false ? [] : [e5.track];
+      for (var u = 0; u < lk5.length; u++) shiftLabels.push(lk5[u].track);
+      var shiftTracks = [];
+      for (var u2 = 0; u2 < shiftLabels.length; u2++) shiftTracks.push(getTrack(s, shiftLabels[u2]).track);
       for (var st5 = 0; st5 < shiftTracks.length; st5++) shiftFollowers(shiftTracks[st5], atT - 2, durT, "");
       var imp = H.import_files({ paths: [a.still_path], bin: "_MCP Plus/Freeze frames" });
-      var pr5 = H.place_clips({ sequence: a.sequence, clips: [{ item: imp.imported[0].id, track: e5.track, start: ticksToSec(atT), duration: ticksToSec(durT), media: "video" }] });
+      var pr5 = H.place_clips({ sequence: a.sequence, clips: [{ item: imp.imported[0].id, track: e5.track, start: ticksToSec(atT), "in": 0, out: ticksToSec(durT), media: "video" }] });
       return { frozenAt: r3(ticksToSec(atT)), duration: r3(ticksToSec(durT)), still: pr5.placed[0] || null, errors: pr5.errors, verified: pr5.placed.length === 1 && Math.abs(pr5.placed[0].start - ticksToSec(atT)) < 0.02 };
     }
     fail("BAD_ARGS", "Unknown action " + act);
@@ -3893,7 +3907,22 @@
       var keep = {}, tl = asArray(a.tracks);
       for (var i = 0; i < tl.length; i++) keep[String(tl[i]).toUpperCase()] = 1;
       for (var t = 0; t < s.audioTracks.numTracks; t++) { var lab = "A" + (t + 1); s.audioTracks[t].setMute(keep[lab] ? 0 : 1); out.push({ track: lab, muted: !!s.audioTracks[t].isMuted() }); }
-      return { tracks: out };
+      return { tracks: out, verified: true };
+    }
+    // unsolo: unmute every audio track. mute/unmute with tracks and no clips: the tracks themselves.
+    if (act === "unsolo" || ((act === "mute" || act === "unmute") && a.tracks && !a.clips)) {
+      var want = {}, tl2 = asArray(a.tracks), all2 = act === "unsolo" && !tl2.length, ok2 = true;
+      for (var i2 = 0; i2 < tl2.length; i2++) want[String(tl2[i2]).toUpperCase()] = 1;
+      for (var t2 = 0; t2 < s.audioTracks.numTracks; t2++) {
+        var lab2 = "A" + (t2 + 1);
+        if (!all2 && !want[lab2]) continue;
+        s.audioTracks[t2].setMute(act === "mute" ? 1 : 0);
+        var m2 = !!s.audioTracks[t2].isMuted();
+        if (m2 !== (act === "mute")) ok2 = false;
+        out.push({ track: lab2, muted: m2 });
+      }
+      if (!out.length) fail("BAD_ARGS", "No audio track matched " + tl2.join(", ") + ".");
+      return { tracks: out, verified: ok2 };
     }
     var list = audioTargets(s, requireClips(s, a.clips), a.include_linked);
     for (var j = 0; j < list.length; j++) {

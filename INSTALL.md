@@ -69,6 +69,7 @@ node tests/e2e-premiere.mjs D:/mcp-plus-test
 node tests/e2e-phase1.mjs D:/mcp-plus-test
 node tests/e2e-phase2.mjs D:/mcp-plus-test
 node tests/e2e-phase3.mjs D:/mcp-plus-test
+node tests/e2e-v253.mjs D:/mcp-plus-test
 node bench/bench.mjs D:/mcp-plus-test          # speed on a clean project
 ```
 

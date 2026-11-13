@@ -10,6 +10,10 @@ import * as cap from "./captions.js";
 /** Phase 2 tools (capability parity). ctx carries the registration helpers from tools.ts. */
 export function registerPhase2(ctx: any) {
   const { tool, call, ANN, seqArg, clipSelector, track, scratch, ensureOutputDir, bridge, jobs, packageRoot } = ctx;
+  /** Writes never default to "every clip of the sequence": clips must be named. */
+  const needClips = (a: any, what: string) => {
+    if (a.clips === undefined || a.clips === null) throw new BridgeError("BAD_ARGS", `${what} needs clips (ids or a selector).`, "Pass clips: ['000f4241'] or {tracks:['V1']}. Use {kind:'video'} to mean every video clip.");
+  };
   const unsupported = (what: string, alt: string) => {
     throw new BridgeError("UNSUPPORTED_IN_PREMIERE", what, alt);
   };
@@ -352,6 +356,7 @@ export function registerPhase2(ctx: any) {
     },
     ANN.write,
     async (a: any) => {
+      if (!["read", "look"].includes(a.action)) needClips(a, `color ${a.action}`);
       if (a.action === "basic") return call("color_basic", a, 120000);
       if (a.action === "read") return call("color_read", a);
       if (a.action === "look") unsupported("A Creative Look file cannot be loaded into Lumetri by script (the Look slot is a binary asset).", "Use apply_lut (input LUT on the source media) or an Effect Preset saved with the look (apply_effect_preset).");
@@ -399,19 +404,30 @@ export function registerPhase2(ctx: any) {
     "stabilize",
     "Stabilize",
     "Apply Warp Stabilizer to clips and wait for Premiere's analysis (use async: true for long clips). status reports whether analysis is done.",
-    { action: z.enum(["apply", "status"]).optional(), sequence: seqArg, clips: clipSelector.optional(), wait: z.boolean().optional().describe("Default true"), timeout_s: z.number().optional() },
+    { action: z.enum(["apply", "status"]).optional(), sequence: seqArg, clips: clipSelector.optional(), wait: z.boolean().optional().describe("Default true"), timeout_s: z.number().optional(), grace_s: z.number().optional().describe("Seconds to wait for the analysis to start, default 20") },
     ANN.write,
     async (a: any, jctx: any) => {
-      if (a.action === "status") return call("analysis_status", a);
+      if (a.action === "status") return { ...((await call("analysis_status", a)) as any), note: "done is also true before an analysis starts; right after apply it does not prove the analysis finished." };
+      needClips(a, "stabilize");
       const r: any = await call("stabilize", a, 120000);
       if (a.wait === false) return r;
       const end = Date.now() + (a.timeout_s || 900) * 1000;
       const t0 = Date.now();
+      // Premiere says "done" until the background analysis actually starts, so
+      // "done" only counts after it was seen busy. Never seen busy within the
+      // grace period: the effect is there but the analysis cannot be confirmed.
+      let seenBusy = false;
+      const grace = (a.grace_s ?? 20) * 1000;
       while (Date.now() < end) {
         const st: any = await call("analysis_status", { sequence: a.sequence });
-        if (st.done && !st.progressItems) return { ...r, analysisDone: true, seconds: Math.round((Date.now() - t0) / 1000), verified: r.clips.every((c: any) => c.added) };
+        const busy = !st.done || st.progressItems > 0;
+        if (busy) seenBusy = true;
+        const added = r.clips.every((c: any) => c.added);
+        if (!busy && seenBusy) return { ...r, analysisDone: true, seconds: Math.round((Date.now() - t0) / 1000), verified: added };
+        if (!busy && Date.now() - t0 > grace)
+          return { ...r, analysisDone: null, seconds: Math.round((Date.now() - t0) / 1000), status: added ? "committed_unverified" : "failed", note: "Warp Stabilizer is on the clips, but Premiere never reported the analysis as running, so its end cannot be confirmed. Check the clip in Premiere (the 'Analyzing' banner)." };
         jctx?.progress?.(Math.min(0.95, (Date.now() - t0) / ((a.timeout_s || 900) * 1000)), "analyzing");
-        await new Promise((res) => setTimeout(res, 2000));
+        await new Promise((res) => setTimeout(res, 1000));
       }
       throw new BridgeError("ANALYSIS_TIMEOUT", "Warp Stabilizer analysis did not finish in time.", "Check Premiere; status reports progress.");
     },
@@ -421,7 +437,7 @@ export function registerPhase2(ctx: any) {
   tool(
     "adjustment_layer",
     "Adjustment layer",
-    "Place an adjustment layer with a duration and effects (or a preset). Premiere cannot create one by script: the first Adjustment Layer found in the project is reused (UNSUPPORTED_IN_PREMIERE when there is none).",
+    "Needs an Adjustment Layer already in the project (Premiere cannot create one by script: make one once with Project panel > New Item > Adjustment Layer). Places it (item, or the first one found) with a duration and effects. UNSUPPORTED_IN_PREMIERE when the project has none.",
     { sequence: seqArg, item: z.string().optional(), track: track.optional(), start: z.number().optional(), duration: z.number().optional(), effects: z.array(z.union([z.string(), z.object({ name: z.string(), params: z.record(z.string(), z.any()).optional() })])).optional() },
     ANN.write,
     (a: any) => call("adjustment_layer", a),
@@ -510,9 +526,9 @@ export function registerPhase2(ctx: any) {
   tool(
     "audio",
     "Audio",
-    "Audio on many clips. pan (-100..100, Balance effect), gain (dB, Amplify effect; clip gain is read-only for scripts), mute/unmute clips, solo_track (mute the other audio tracks), normalize (each clip's volume set so its media range hits target LUFS, default -16 voice / -23 music), loudness (measure clips), duck (lower music clips under voice clips with volume keyframes from the voice envelope: duck_db, attack, release, padding), detect_beats / detect_transients (of a clip's media), effect (DeNoise, DeEsser, Dynamics, Parametric Equalizer, Hard Limiter, Studio Reverb... with params). channel_mapping returns UNSUPPORTED_IN_PREMIERE.",
+    "Audio on many clips. pan (-100..100, Balance effect), gain (dB, Amplify effect; clip gain is read-only for scripts), mute/unmute clips (or tracks: pass tracks without clips), solo_track (mute the other audio tracks), unsolo (unmute all audio tracks), normalize (each clip's volume set so its media range hits target LUFS, default -16 voice / -23 music), loudness (measure clips), duck (lower music clips under voice clips with volume keyframes from the voice envelope: duck_db, attack, release, padding), detect_beats / detect_transients (of a clip's media), effect (DeNoise, DeEsser, Dynamics, Parametric Equalizer, Hard Limiter, Studio Reverb... with params). channel_mapping returns UNSUPPORTED_IN_PREMIERE.",
     {
-      action: z.enum(["pan", "gain", "mute", "unmute", "solo_track", "normalize", "loudness", "duck", "detect_beats", "detect_transients", "effect", "channel_mapping"]),
+      action: z.enum(["pan", "gain", "mute", "unmute", "solo_track", "unsolo", "normalize", "loudness", "duck", "detect_beats", "detect_transients", "effect", "channel_mapping"]),
       sequence: seqArg,
       clips: clipSelector.optional(),
       tracks: z.array(z.string()).optional(),
@@ -532,7 +548,8 @@ export function registerPhase2(ctx: any) {
     ANN.write,
     async (a: any, jctx: any) => {
       if (a.action === "channel_mapping") unsupported("Premiere 26.x has no scripting call for a clip's audio channel mapping.", "Use Clip > Modify > Audio Channels in Premiere.");
-      if (["pan", "gain", "mute", "unmute", "solo_track"].includes(a.action)) return call("audio_tools", a);
+      if (["pan", "gain", "normalize", "effect"].includes(a.action) || ((a.action === "mute" || a.action === "unmute") && !a.tracks)) needClips(a, `audio ${a.action}`);
+      if (["pan", "gain", "mute", "unmute", "solo_track", "unsolo"].includes(a.action)) return call("audio_tools", a);
       if (a.action === "effect") return call("apply_effects", { sequence: a.sequence, clips: a.clips, effects: a.effects }, 120000);
       if (a.action === "detect_beats" || a.action === "detect_transients") {
         const src: any = await sources(a.sequence, a.clips);
@@ -628,8 +645,10 @@ export function registerPhase2(ctx: any) {
       ensureOutputDir(transcriptDir);
       const scriptDir = path.join(packageRoot(), "scripts");
       const parts: { file: string; start?: number; dur?: number; offset: number; speed: number }[] = [];
-      if (a.file) parts.push({ file: path.resolve(a.file), offset: 0, speed: 1 });
-      else {
+      if (a.file) {
+        if (!fs.existsSync(path.resolve(a.file))) throw new BridgeError("FILE_NOT_FOUND", `File not found: ${path.resolve(a.file)}`);
+        parts.push({ file: path.resolve(a.file), offset: 0, speed: 1 });
+      } else {
         const src: any = await sources(a.sequence, a.clips ?? { kind: "audio" });
         for (const c of src.clips.filter((x: any) => x.media && !x.video)) parts.push({ file: c.media, start: c.in, dur: c.out - c.in, offset: c.start - c.in / (c.speed || 1), speed: c.speed || 1 });
         if (!parts.length) throw new BridgeError("NO_AUDIO", "No audio clips with media in the selection.");
@@ -671,7 +690,7 @@ export function registerPhase2(ctx: any) {
   tool(
     "captions",
     "Captions",
-    "Captions from transcripts or subtitle files. create_track (import an SRT/VTT, or a transcript, as a caption track), read (cues of a subtitle file or transcript), edit (replace text/times of cues by index and rewrite the file), retime (shift and/or stretch), export (SRT or VTT), safe_zone_check (caption block vs. the platform's UI-safe area: youtube, shorts, reels, tiktok, instagram_feed), burn_style (render styled PNG captions, optionally one card per word with the spoken word highlighted like Shorts, and place them on a video track). Premiere's scripting API cannot read caption tracks already in a sequence: read works on files and transcripts.",
+    "Captions from transcripts or subtitle files. create_track (import an SRT/VTT, or a transcript, as a caption track), read (cues of a subtitle file or transcript), edit (replace text/times of cues by index; writes an SRT, or rewrites the .srt/.vtt given as source; a transcript is never changed: use the returned path as source next), retime (shift and/or stretch), export (SRT or VTT), safe_zone_check (caption block vs. the platform's UI-safe area: youtube, shorts, reels, tiktok, instagram_feed), burn_style (render styled PNG captions, optionally one card per word with the spoken word highlighted like Shorts, and place them on a video track). Premiere's scripting API cannot read caption tracks already in a sequence: read works on files and transcripts.",
     {
       action: z.enum(["create_track", "read", "edit", "retime", "export", "safe_zone_check", "burn_style"]),
       sequence: seqArg,
@@ -717,7 +736,7 @@ export function registerPhase2(ctx: any) {
           if (e.end !== undefined) c.end = e.end;
         }
         const f = write(cues, a.output || (/\.(srt|vtt)$/i.test(a.source) ? a.source : undefined));
-        return { path: f, edited: (a.edits || []).length, verified: cap.parseSubtitles(fs.readFileSync(f, "utf-8")).length === cues.length };
+        return { path: f, edited: (a.edits || []).length, note: /^tr_|\.json$/i.test(String(a.source)) ? "The transcript is unchanged; the edited cues are in path. Pass path as source to keep working on them." : undefined, verified: cap.parseSubtitles(fs.readFileSync(f, "utf-8")).length === cues.length };
       }
       if (a.action === "retime") {
         cues = cap.retime(cues, a.shift || 0, a.factor || 1);

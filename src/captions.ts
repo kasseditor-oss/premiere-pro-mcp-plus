@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Resvg } from "@resvg/resvg-js";
+import { fontOptions } from "./titles.js";
 import { escapeXml } from "./media.js";
 
 export interface Cue {
@@ -129,7 +130,7 @@ export function renderCaptionCard(text: string, width: number, height: number, s
     parts.push(`<text x="${width / 2}" y="${y0 + li * lh}" font-family="${escapeXml(fam)}" font-size="${size}" font-weight="bold" text-anchor="middle" stroke="${style.stroke_color || "#000000"}" stroke-width="${stroke}" stroke-linejoin="round" paint-order="stroke">${spans}</text>`);
   });
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${parts.join("")}</svg>`;
-  const r = new Resvg(svg, { font: { fontFiles: style.font_file ? [style.font_file] : [], loadSystemFonts: true, defaultFontFamily: fam }, fitTo: { mode: "original" } });
+  const r = new Resvg(svg, { font: style.font_file ? { fontFiles: [style.font_file], loadSystemFonts: true, defaultFontFamily: fam } : fontOptions(fam), fitTo: { mode: "original" } });
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, r.render().asPng());
   // Bounds of the text block (for the safe-zone check).

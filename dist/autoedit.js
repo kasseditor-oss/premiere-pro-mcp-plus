@@ -26,24 +26,44 @@ export function silencesBetween(active, from, to, minSilence, padding) {
         out.push({ start: cur + padding, end: to });
     return out.filter((r) => r.end - r.start > 0.04).map((r) => ({ start: r3(r.start), end: r3(r.end) }));
 }
+// Per language. Matching keeps accents: in Portuguese "é" (filler or verb) is not "e" (and).
 export const FILLERS = {
-    pt: ["é", "éé", "ééé", "eh", "ãh", "ã", "ah", "ahn", "hum", "hmm", "uhm", "tipo", "né", "assim", "então", "bom", "enfim"],
-    en: ["um", "uh", "uhm", "umm", "erm", "er", "ah", "hmm", "like", "you know", "i mean", "so", "basically", "actually"],
+    pt: ["é", "éé", "ééé", "eh", "ehh", "ãh", "ã", "ãã", "ah", "ahn", "hum", "hmm", "uhm", "tipo", "né", "assim", "então", "bom", "enfim"],
+    en: ["um", "umm", "uh", "uhm", "erm", "er", "ah", "hmm", "like", "you know", "i mean", "so", "basically", "actually"],
+    es: ["eh", "ehh", "em", "este", "o sea", "pues", "bueno", "mmm", "hmm"],
 };
+/** Words that only count as fillers when isolated by pauses (or followed by a comma). */
+export const SOFT_FILLERS = ["é", "né", "like", "so", "tipo", "assim", "então", "bom", "basically", "actually", "enfim", "este", "pues", "bueno", "o sea"];
+/** Function words that are never fillers in the default lists (articles, conjunctions). */
+const NEVER = { pt: ["e", "um", "uma", "o", "a", "de", "que", "eu"], es: ["e", "un", "una", "el", "la", "de", "que"], en: ["a", "and", "the", "i"] };
+/** Default filler list for a language code ("pt", "en"...); unknown: pt + en without cross-language collisions. */
+export function fillersFor(lang) {
+    if (lang && FILLERS[lang])
+        return FILLERS[lang].filter((w) => !(NEVER[lang] || []).includes(w));
+    const all = [...new Set([...FILLERS.pt, ...FILLERS.en])];
+    return all.filter((w) => !NEVER.pt.includes(w) && !NEVER.es.includes(w));
+}
+/** Lowercase, no punctuation, accents removed (for loose text matching). */
 export const norm = (w) => w
     .toLowerCase()
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "")
     .replace(/[^\p{L}\p{N}' ]/gu, "")
     .trim();
+/** Lowercase, no punctuation, accents kept ("é" stays different from "e"). */
+export const normAccent = (w) => w
+    .toLowerCase()
+    .normalize("NFC")
+    .replace(/[^\p{L}\p{N}' ]/gu, "")
+    .trim();
 /** Filler words (single or two-word) in a transcript; conservative words only when isolated by pauses. */
-export function fillerRanges(words, list, soft = ["like", "so", "tipo", "assim", "entao", "bom", "basically", "actually", "enfim"]) {
-    const set = new Set(list.map(norm));
-    const softSet = new Set(soft.map(norm));
+export function fillerRanges(words, list, soft = SOFT_FILLERS) {
+    const set = new Set(list.map(normAccent));
+    const softSet = new Set(soft.map(normAccent));
     const out = [];
     for (let i = 0; i < words.length; i++) {
-        const w = norm(words[i].word);
-        const two = i + 1 < words.length ? `${w} ${norm(words[i + 1].word)}` : "";
+        const w = normAccent(words[i].word);
+        const two = i + 1 < words.length ? `${w} ${normAccent(words[i + 1].word)}` : "";
         if (two && set.has(two)) {
             out.push({ start: words[i].start, end: words[i + 1].end, word: two });
             i++;
